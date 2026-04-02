@@ -1,174 +1,125 @@
 #!/usr/bin/env python3
 """
 Voice Clone Studio — CLI Pipeline Runner
-Connects all modules end-to-end for testing the full pipeline.
+Delegates to AppBackend — the same code path a future UI will use.
 
 Usage:
-    python pipeline.py --files audio1.mp3 audio2.wav --model-name myvoice
-    python pipeline.py --files audio.mp3 --model-name myvoice \
-                       --email user@example.com --password secret
+  python pipeline.py --files audio.mp3 --model-name myvoice
+  python pipeline.py --files a.mp3 b.wav --model-name myvoice --resume
+  python pipeline.py --files audio.mp3 --model-name myvoice \
+                     --email user@example.com --password secret
+  python pipeline.py --status <session_id>
+  python pipeline.py --checkpoints <session_id>
+  python pipeline.py --test-checkpoint <session_id> <checkpoint.pth> <test.wav>
+  python pipeline.py --list-sessions
 """
 
 import argparse
+import json
 import sys
-import time
-from datetime import datetime, timezone
 
 
 def run_pipeline():
     parser = argparse.ArgumentParser(
-        description="Voice Clone Studio — local voice cloning pipeline"
+        description="Voice Clone Studio — backend pipeline CLI"
     )
-    parser.add_argument(
-        "--files",
-        nargs="+",
-        required=True,
-        metavar="FILE",
-        help="Input audio/video files (MP3, WAV, FLAC, MP4, MKV)",
-    )
-    parser.add_argument(
-        "--model-name",
-        required=True,
-        metavar="NAME",
-        help="Name for the trained voice model",
-    )
-    parser.add_argument(
-        "--email",
-        default=None,
-        help="Supabase account email (optional)",
-    )
-    parser.add_argument(
-        "--password",
-        default=None,
-        help="Supabase account password (optional)",
-    )
+
+    # ── Actions ──────────────────────────────────────────────────────
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--status",       metavar="SESSION_ID",
+                        help="Show status of a session")
+    action.add_argument("--checkpoints",  metavar="SESSION_ID",
+                        help="List checkpoints for a session")
+    action.add_argument("--list-sessions", action="store_true",
+                        help="List all sessions")
+    action.add_argument("--test-checkpoint", nargs=3,
+                        metavar=("SESSION_ID", "CKPT_PATH", "TEST_AUDIO"),
+                        help="Test a specific checkpoint")
+    action.add_argument("--segments",     metavar="SESSION_ID",
+                        help="List segments for a session")
+
+    # ── Pipeline args ────────────────────────────────────────────────
+    parser.add_argument("--files",       nargs="+", metavar="FILE")
+    parser.add_argument("--model-name",  metavar="NAME")
+    parser.add_argument("--resume",      action="store_true",
+                        help="Resume training from latest checkpoint")
+    parser.add_argument("--resume-session", metavar="SESSION_ID",
+                        help="Resume a specific paused session")
+    parser.add_argument("--email",       default=None)
+    parser.add_argument("--password",    default=None)
+
     args = parser.parse_args()
 
-    start_time = time.time()
+    from services.backend import AppBackend
+    backend = AppBackend()
 
-    # ------------------------------------------------------------------
-    # Step 1: Preprocessing
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 1 — AUDIO PREPROCESSING")
-    print("=" * 60)
-
-    try:
-        from core.preprocessing import AudioPreprocessor, PreprocessingError
-        preprocessor = AudioPreprocessor()
-        stats = preprocessor.process(args.files)
-    except PreprocessingError as e:
-        print(f"\n[ERROR] Preprocessing failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n[ERROR] Unexpected preprocessing error: {e}")
-        sys.exit(1)
-
-    print("\n--- Quality Report ---")
-    print(f"  Segments:       {stats['segment_count']}")
-    print(f"  Total duration: {stats['total_duration_minutes']:.2f} minutes")
-    print(f"  Quality label:  {stats['quality_label']}")
-    print(f"  Segment paths:  {len(stats['segment_paths'])} files in dataset/segments/")
-
-    # ------------------------------------------------------------------
-    # Step 2: LLM Hyperparameter Config
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 2 — LLM HYPERPARAMETER CONFIG")
-    print("=" * 60)
-
-    try:
-        from core.llm_config import LLMConfigurator
-        configurator = LLMConfigurator()
-        hyperparams = configurator.get_hyperparameters(stats)
-    except Exception as e:
-        print(f"\n[ERROR] Hyperparameter config failed: {e}")
-        sys.exit(1)
-
-    print("\n--- Hyperparameters ---")
-    for k, v in hyperparams.items():
-        print(f"  {k}: {v}")
-
-    # ------------------------------------------------------------------
-    # Step 3: Training
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 3 — RVC TRAINING")
-    print("=" * 60)
-    print(f"  Model name:   {args.model_name}")
-    print(f"  Dataset path: dataset/segments")
-    print()
-
-    epochs_completed = 0
-
-    def on_progress(epoch: int, loss: float):
-        nonlocal epochs_completed
-        epochs_completed = epoch
-        print(f"  Epoch {epoch:>4d} | Loss {loss:.6f}")
-
-    try:
-        from core.training_engine import TrainingEngine
-        engine = TrainingEngine()
-        model_path = engine.start_training(
-            dataset_path="dataset/segments",
-            model_name=args.model_name,
-            hyperparams=hyperparams,
-            progress_callback=on_progress,
-        )
-    except Exception as e:
-        print(f"\n[ERROR] Training failed: {e}")
-        sys.exit(1)
-
-    print(f"\n[Pipeline] Model saved: {model_path}")
-
-    # ------------------------------------------------------------------
-    # Step 4: Supabase sync (optional)
-    # ------------------------------------------------------------------
-    elapsed = time.time() - start_time
-
+    # Optional auth
     if args.email and args.password:
-        print("\n" + "=" * 60)
-        print("STEP 4 — SUPABASE SYNC")
-        print("=" * 60)
+        result = backend.login(args.email, args.password)
+        if result["ok"]:
+            print(f"[Auth] Logged in (user_id={result['user_id']})")
+        else:
+            print("[Auth] Login failed — continuing without Supabase sync.")
 
-        try:
-            from services.supabase_client import SupabaseClient
-            from core.llm_config import LLMConfigurator
+    # ── Dispatch ─────────────────────────────────────────────────────
 
-            client = SupabaseClient()
-            logged_in = client.login(args.email, args.password)
+    if args.status:
+        result = backend.get_session_status(args.status)
+        _print_json(result)
+        return
 
-            if logged_in:
-                hw_info = LLMConfigurator()._scan_hardware()
-                metadata = {
-                    "user_id":          client.user_id,
-                    "model_name":       args.model_name,
-                    "status":           "completed",
-                    "duration_seconds": int(elapsed),
-                    "epochs_completed": epochs_completed,
-                    "hardware_profile": hw_info,
-                    "created_at":       datetime.now(timezone.utc).isoformat(),
-                }
-                synced = client.sync_training_session(metadata)
-                if not synced:
-                    print("[Pipeline] Session sync failed (continuing anyway).")
-            else:
-                print("[Pipeline] Login failed — skipping sync.")
-        except Exception as e:
-            print(f"[Pipeline] Supabase step error (non-fatal): {e}")
-    else:
-        print("\n[Pipeline] No credentials provided — skipping Supabase sync.")
+    if args.list_sessions:
+        result = backend.list_sessions()
+        for s in result["sessions"]:
+            print(f"  {s['session_id'][:8]}  {s['model_name']:20s}  "
+                  f"{s['status']:15s}  epoch={s['current_epoch']}/{s['total_epochs']}  "
+                  f"{s['created_at'][:19]}")
+        return
 
-    # ------------------------------------------------------------------
-    # Done
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE")
-    print("=" * 60)
-    print(f"  Model:    {model_path}")
-    print(f"  Duration: {elapsed:.1f}s")
-    print(f"  Quality:  {stats['quality_label']}")
-    print()
+    if args.checkpoints:
+        result = backend.list_checkpoints(args.checkpoints)
+        _print_json(result)
+        return
+
+    if args.test_checkpoint:
+        session_id, ckpt_path, test_audio = args.test_checkpoint
+        result = backend.test_checkpoint(session_id, ckpt_path, test_audio)
+        _print_json(result)
+        return
+
+    if args.segments:
+        result = backend.get_segments(args.segments)
+        segs   = result.get("segments", [])
+        print(f"  {'PATH':60s}  {'DUR':6s}  {'APPROVED'}")
+        for s in segs:
+            print(f"  {s['path']:60s}  {s['duration_s']:5.1f}s  {s.get('approved', True)}")
+        return
+
+    if args.resume_session:
+        print(f"[Pipeline] Resuming session {args.resume_session}...")
+        result = backend.resume_pipeline(args.resume_session, async_mode=False)
+        _print_json(result)
+        return
+
+    # ── Default: full pipeline run ────────────────────────────────────
+    if not args.files or not args.model_name:
+        parser.print_help()
+        sys.exit(1)
+
+    print(f"\n[Pipeline] Starting: model='{args.model_name}' "
+          f"files={len(args.files)} resume={args.resume}")
+
+    result = backend.run_pipeline(
+        files=args.files,
+        model_name=args.model_name,
+        async_mode=False,
+    )
+
+    _print_json(result)
+
+
+def _print_json(obj: dict) -> None:
+    print(json.dumps(obj, indent=2))
 
 
 if __name__ == "__main__":

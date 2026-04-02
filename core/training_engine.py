@@ -1,36 +1,37 @@
 """
 RVC Training Engine
 Drives Applio's full pipeline: preprocess → extract → train.
-All subprocess calls use cwd=APPLIO_ROOT (Applio's root directory).
-Checkpoints saved to {APPLIO_ROOT}/logs/{model_name}/
+Supports:
+  - Resume from existing checkpoint (skips preprocess/extract if done)
+  - Per-epoch checkpoint saving
+  - Graceful stop with guaranteed latest checkpoint saved
+  - Checkpoint testing via inference
 """
 
 import os
 import re
+import signal
 import subprocess
 import threading
 from pathlib import Path
 
-# Applio is cloned at rvc/ in the project root
 APPLIO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "rvc")
 )
-# Applio saves everything under its own logs/
 APPLIO_LOGS = os.path.join(APPLIO_ROOT, "logs")
+PYTHON      = "python"
 
-PYTHON = "python"
-
-# Regex matching Applio's stdout:
-# "mymodel | epoch=42 | step=1250 | time=... | lowest_value=0.1234 ..."
 EPOCH_RE = re.compile(r"epoch=(\d+)")
 LOSS_RE  = re.compile(r"lowest_value=([0-9]+\.[0-9]+)")
+STEP_RE  = re.compile(r"step=(\d+)")
 
 
 class TrainingEngine:
 
     def __init__(self):
         self._process: subprocess.Popen | None = None
-        self._lock = threading.Lock()
+        self._lock    = threading.Lock()
+        self._stop_requested = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -39,81 +40,86 @@ class TrainingEngine:
     def start_training(
         self,
         dataset_path: str,
-        model_name: str,
-        hyperparams: dict,
+        model_name:   str,
+        hyperparams:  dict,
         progress_callback=None,
+        resume: bool = False,
     ) -> str:
         """
-        Run the full Applio pipeline:
-          1. preprocess  → slice audio into mel-spec training data
-          2. extract     → F0 pitch + HuBERT embeddings
-          3. train       → RVC model training (streams epoch/loss)
+        Run the full Applio pipeline.
 
-        Returns path to the final G_*.pth checkpoint.
+        Args:
+            resume: If True, skip preprocess+extract when they've already run.
+                    Training auto-resumes from the latest checkpoint.
+        Returns:
+            Path to the latest G_*.pth checkpoint.
         """
+        self._stop_requested = False
         dataset_path = os.path.abspath(dataset_path)
         batch_size   = hyperparams.get("batch_size", 4)
         epochs       = hyperparams.get("epochs", 300)
         save_every   = hyperparams.get("save_every_n_epochs", 50)
         cpu_cores    = os.cpu_count() or 4
 
-        # ── Step 1: Preprocess ─────────────────────────────────────────
-        self._run_step(
-            label="Preprocess",
-            cmd=[
-                PYTHON,
-                os.path.join("rvc", "train", "preprocess", "preprocess.py"),
-                os.path.join(APPLIO_LOGS, model_name),  # output log dir
-                dataset_path,                            # input audio dir
-                "48000",                                 # sample rate
-                str(cpu_cores),
-                "Automatic",                             # cut_preprocess
-                "False",                                 # process_effects
-                "False",                                 # noise_reduction
-                "0.7",                                   # clean_strength
-                "3.0",                                   # chunk_len (seconds)
-                "0.3",                                   # overlap_len
-                "none",                                  # normalization_mode
-            ],
-        )
+        already_extracted = self._extraction_done(model_name)
 
-        # ── Step 2: Extract F0 + embeddings ───────────────────────────
-        self._run_step(
-            label="Extract",
-            cmd=[
-                PYTHON,
-                os.path.join("rvc", "train", "extract", "extract.py"),
-                os.path.join(APPLIO_LOGS, model_name),
-                "rmvpe",        # f0_method
-                str(cpu_cores),
-                "0",            # gpu index
-                "48000",        # sample_rate
-                "contentvec",   # embedder_model
-                "None",         # embedder_model_custom
-                "2",            # include_mutes
-            ],
-        )
+        if resume and already_extracted:
+            print(f"[TrainingEngine] Resuming '{model_name}' — skipping preprocess+extract.")
+        else:
+            self._run_step(
+                label="Preprocess",
+                cmd=[
+                    PYTHON,
+                    os.path.join("rvc", "train", "preprocess", "preprocess.py"),
+                    os.path.join(APPLIO_LOGS, model_name),
+                    dataset_path,
+                    "48000",
+                    str(cpu_cores),
+                    "Automatic",
+                    "False",
+                    "False",
+                    "0.7",
+                    "3.0",
+                    "0.3",
+                    "none",
+                ],
+            )
+            self._run_step(
+                label="Extract",
+                cmd=[
+                    PYTHON,
+                    os.path.join("rvc", "train", "extract", "extract.py"),
+                    os.path.join(APPLIO_LOGS, model_name),
+                    "rmvpe",
+                    str(cpu_cores),
+                    "0",
+                    "48000",
+                    "contentvec",
+                    "None",
+                    "2",
+                ],
+            )
 
-        # ── Step 3: Train (streams stdout) ────────────────────────────
+        # Train — Applio auto-resumes from latest G_*.pth if it exists
         train_cmd = [
             PYTHON, "-u",
             os.path.join("rvc", "train", "train.py"),
             model_name,
-            str(save_every),   # save_every_epoch
-            str(epochs),       # total_epoch
+            str(save_every),
+            str(epochs),
             os.path.join("rvc", "models", "pretraineds", "hifi-gan", "f0G48k.pth"),
             os.path.join("rvc", "models", "pretraineds", "hifi-gan", "f0D48k.pth"),
-            "0",               # gpus
+            "0",
             str(batch_size),
-            "48000",           # sample_rate
-            "true",            # save_only_latest
-            "true",            # save_every_weights
-            "false",           # cache_data_in_gpu
-            "false",           # overtraining_detector
-            "50",              # overtraining_threshold
-            "false",           # cleanup
-            "HiFi-GAN",        # vocoder (matches f0G/D48k.pth pretrained weights)
-            "false",           # checkpointing
+            "48000",
+            "true",   # save_only_latest
+            "true",   # save_every_weights
+            "false",  # cache_data_in_gpu
+            "false",  # overtraining_detector
+            "50",     # overtraining_threshold
+            "false",  # cleanup
+            "HiFi-GAN",
+            "false",  # checkpointing
         ]
 
         print(f"[TrainingEngine] Starting training: {model_name}")
@@ -149,20 +155,54 @@ class TrainingEngine:
                 except Exception as cb_err:
                     print(f"[TrainingEngine] Callback error: {cb_err}")
 
+            # Honour stop request between epochs
+            if self._stop_requested and e_match:
+                print("[TrainingEngine] Stop requested — terminating after epoch.")
+                with self._lock:
+                    if self._process and self._process.poll() is None:
+                        self._process.terminate()
+                break
+
         self._process.wait()
         ret = self._process.returncode
         with self._lock:
             self._process = None
 
-        if ret != 0:
+        if ret not in (0, -15):  # -15 = SIGTERM (graceful stop)
             raise RuntimeError(f"Training exited with code {ret}")
 
         final_path = self._find_latest_checkpoint(model_name)
         print(f"[TrainingEngine] Done. Checkpoint: {final_path}")
         return final_path
 
+    def resume_training(
+        self,
+        dataset_path: str,
+        model_name:   str,
+        hyperparams:  dict,
+        progress_callback=None,
+    ) -> str:
+        """Convenience wrapper — always sets resume=True."""
+        return self.start_training(
+            dataset_path=dataset_path,
+            model_name=model_name,
+            hyperparams=hyperparams,
+            progress_callback=progress_callback,
+            resume=True,
+        )
+
     def stop_training(self) -> None:
-        """Gracefully terminate the training subprocess."""
+        """Signal training to stop cleanly after the current epoch completes."""
+        self._stop_requested = True
+        with self._lock:
+            proc = self._process
+        if proc and proc.poll() is None:
+            print("[TrainingEngine] Stop signal sent — waiting for epoch boundary...")
+        else:
+            print("[TrainingEngine] No active training process.")
+
+    def force_stop(self) -> None:
+        """Immediately terminate training (checkpoint may be incomplete)."""
         with self._lock:
             proc = self._process
         if proc and proc.poll() is None:
@@ -171,37 +211,100 @@ class TrainingEngine:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-            print("[TrainingEngine] Training stopped.")
-        else:
-            print("[TrainingEngine] No active training process.")
+            print("[TrainingEngine] Training force-stopped.")
+        with self._lock:
+            self._process = None
 
     def get_checkpoint_list(self, model_name: str) -> list:
-        """Return sorted list of G_*.pth checkpoints for model_name."""
+        """Return sorted list of per-epoch *_Ne_*s.pth checkpoints."""
         model_dir = os.path.join(APPLIO_LOGS, model_name)
         if not os.path.isdir(model_dir):
             return []
-        return sorted(str(p) for p in Path(model_dir).glob("G_*.pth"))
+        # Per-epoch named checkpoints: e.g. mymodel_50e_1100s.pth
+        named = sorted(
+            str(p) for p in Path(model_dir).glob(f"{model_name}_*e_*s.pth")
+        )
+        # Latest-only checkpoint
+        latest = str(Path(model_dir) / "G_2333333.pth")
+        result = named
+        if os.path.exists(latest) and latest not in result:
+            result = result + [latest]
+        return result
+
+    def test_checkpoint(
+        self,
+        model_name:      str,
+        checkpoint_path: str,
+        test_audio_path: str,
+        output_path:     str | None = None,
+        pitch_shift:     int = 0,
+    ) -> str:
+        """
+        Run inference on a checkpoint to listen to its quality.
+        Returns path to the converted output WAV.
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        if not os.path.exists(test_audio_path):
+            raise FileNotFoundError(f"Test audio not found: {test_audio_path}")
+
+        if output_path is None:
+            ckpt_stem   = Path(checkpoint_path).stem
+            output_path = os.path.join(
+                APPLIO_LOGS, model_name, f"test_{ckpt_stem}.wav"
+            )
+
+        from core.inference_engine import InferenceEngine
+        engine = InferenceEngine()
+        result = engine.convert(
+            model_path=checkpoint_path,
+            input_audio_path=test_audio_path,
+            output_path=output_path,
+            pitch_shift=pitch_shift,
+        )
+        print(f"[TrainingEngine] Checkpoint test saved: {result}")
+        return result
+
+    def get_training_status(self, model_name: str) -> dict:
+        """Return current training state for a model."""
+        checkpoints   = self.get_checkpoint_list(model_name)
+        is_running    = False
+        with self._lock:
+            is_running = self._process is not None and self._process.poll() is None
+
+        latest_epoch  = 0
+        if checkpoints:
+            # Parse epoch from filename like mymodel_42e_924s.pth
+            m = re.search(r"_(\d+)e_", Path(checkpoints[-1]).name)
+            if m:
+                latest_epoch = int(m.group(1))
+
+        return {
+            "model_name":    model_name,
+            "is_running":    is_running,
+            "checkpoints":   checkpoints,
+            "latest_epoch":  latest_epoch,
+            "extraction_done": self._extraction_done(model_name),
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _extraction_done(self, model_name: str) -> bool:
+        """True if filelist.txt exists and is non-empty (extract already ran)."""
+        filelist = os.path.join(APPLIO_LOGS, model_name, "filelist.txt")
+        return os.path.exists(filelist) and os.path.getsize(filelist) > 0
+
     def _run_step(self, label: str, cmd: list) -> None:
-        """Run a blocking subprocess step from APPLIO_ROOT."""
         print(f"[TrainingEngine] {label}: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            cwd=APPLIO_ROOT,
-            capture_output=False,
-        )
+        result = subprocess.run(cmd, cwd=APPLIO_ROOT, capture_output=False)
         if result.returncode != 0:
-            raise RuntimeError(
-                f"{label} step failed with exit code {result.returncode}"
-            )
+            raise RuntimeError(f"{label} step failed with exit code {result.returncode}")
         print(f"[TrainingEngine] {label} complete.")
 
     def _find_latest_checkpoint(self, model_name: str) -> str:
         checkpoints = self.get_checkpoint_list(model_name)
         if checkpoints:
             return checkpoints[-1]
-        return os.path.join(APPLIO_LOGS, model_name, f"G_2333333.pth")
+        return os.path.join(APPLIO_LOGS, model_name, "G_2333333.pth")
