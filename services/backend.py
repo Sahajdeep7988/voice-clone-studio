@@ -159,14 +159,16 @@ class AppBackend:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
-        preprocessor = AudioPreprocessor(base_dir=self.base_dir)
+        session_base = os.path.join(self.base_dir, "sessions_data", session_id)
+        preprocessor = AudioPreprocessor(base_dir=session_base)
         return {"ok": True, "segments": preprocessor.get_segments()}
 
     def approve_segments(self, session_id: str, approved_paths: list) -> dict:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
-        preprocessor = AudioPreprocessor(base_dir=self.base_dir)
+        session_base = os.path.join(self.base_dir, "sessions_data", session_id)
+        preprocessor = AudioPreprocessor(base_dir=session_base)
         count = preprocessor.approve_segments(approved_paths)
         self.sessions.update_session(session_id, segment_manifest=preprocessor.manifest)
         return {"ok": True, "approved_count": count}
@@ -175,7 +177,8 @@ class AppBackend:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
-        preprocessor = AudioPreprocessor(base_dir=self.base_dir)
+        session_base = os.path.join(self.base_dir, "sessions_data", session_id)
+        preprocessor = AudioPreprocessor(base_dir=session_base)
         ok = preprocessor.delete_segment(path)
         return {"ok": ok}
 
@@ -251,13 +254,22 @@ class AppBackend:
             if f.lower().endswith(".wav")
         ]
 
+        import wave
+
         # Remove empty files and count valid ones
         valid  = []
         empty  = []
         for f in all_wavs:
             full = os.path.join(dataset_path, f)
             if os.path.getsize(full) > 0:
-                valid.append(f)
+                try:
+                    with wave.open(full, "rb") as wf:
+                        if wf.getnframes() > 0:
+                            valid.append(f)
+                        else:
+                            empty.append(full)
+                except Exception:
+                    empty.append(full)
             else:
                 empty.append(full)
 
@@ -303,7 +315,8 @@ class AppBackend:
         try:
             # ── Preprocess ────────────────────────────────────────────
             self.sessions.set_status(session_id, "preprocessing")
-            preprocessor = AudioPreprocessor(base_dir=self.base_dir)
+            session_base = os.path.join(self.base_dir, "sessions_data", session_id)
+            preprocessor = AudioPreprocessor(base_dir=session_base)
 
             with log.timed("preprocess"):
                 if resume:
@@ -352,7 +365,7 @@ class AppBackend:
                 )
 
             # ── Validate dataset ──────────────────────────────────────
-            dataset_path = os.path.join(self.base_dir, "dataset", "segments")
+            dataset_path = os.path.join(session_base, "dataset", "segments")
             validation   = self._validate_dataset(dataset_path)
             if not validation["ok"]:
                 self.sessions.set_status(session_id, "error", validation["error"])
@@ -384,7 +397,7 @@ class AppBackend:
 
             with log.timed("training"):
                 model_path = engine.start_training(
-                    dataset_path=os.path.join(self.base_dir, "dataset", "segments"),
+                    dataset_path=os.path.join(session_base, "dataset", "segments"),
                     model_name=model_name,
                     hyperparams=hyperparams,
                     progress_callback=on_progress,
