@@ -101,8 +101,8 @@ class TrainingEngine:
             model_name,
             str(save_every),   # save_every_epoch
             str(epochs),       # total_epoch
-            os.path.join("rvc", "models", "pretraineds", "refinegan", "f0G48k.pth"),
-            os.path.join("rvc", "models", "pretraineds", "refinegan", "f0D48k.pth"),
+            os.path.join("rvc", "models", "pretraineds", "hifi-gan", "f0G48k.pth"),
+            os.path.join("rvc", "models", "pretraineds", "hifi-gan", "f0D48k.pth"),
             "0",               # gpus
             str(batch_size),
             "48000",           # sample_rate
@@ -112,7 +112,7 @@ class TrainingEngine:
             "false",           # overtraining_detector
             "50",              # overtraining_threshold
             "false",           # cleanup
-            "RefineGAN",       # vocoder
+            "HiFi-GAN",        # vocoder (matches f0G/D48k.pth pretrained weights)
             "false",           # checkpointing
         ]
 
