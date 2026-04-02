@@ -164,6 +164,8 @@ class InferenceEngine:
             raise FileNotFoundError(f"Model not found: {model_path}")
         if not os.path.exists(input_audio_path):
             raise FileNotFoundError(f"Input audio not found: {input_audio_path}")
+        if os.path.getsize(input_audio_path) == 0:
+            raise ValueError(f"Input audio is empty: {input_audio_path}")
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -189,6 +191,9 @@ class InferenceEngine:
                 resample_sr=0,
                 sid=0,
             )
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(f"Inference failed, output path empty or missing: {output_path}")
 
         return output_path
 

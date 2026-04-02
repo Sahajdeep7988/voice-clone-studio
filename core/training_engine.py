@@ -136,35 +136,45 @@ class TrainingEngine:
         last_epoch = 0
         last_loss  = 0.0
 
-        for line in self._process.stdout:
-            line = line.rstrip()
-            if line:
-                print(f"[RVC] {line}")
+        try:
+            for line in self._process.stdout:
+                line = line.rstrip()
+                if line:
+                    print(f"[RVC] {line}")
 
-            e_match = EPOCH_RE.search(line)
-            l_match = LOSS_RE.search(line)
+                e_match = EPOCH_RE.search(line)
+                l_match = LOSS_RE.search(line)
 
-            if e_match:
-                last_epoch = int(e_match.group(1))
-            if l_match:
-                last_loss = float(l_match.group(1))
+                if e_match:
+                    last_epoch = int(e_match.group(1))
+                if l_match:
+                    last_loss = float(l_match.group(1))
 
-            if e_match and l_match and progress_callback:
-                try:
-                    progress_callback(last_epoch, last_loss)
-                except Exception as cb_err:
-                    print(f"[TrainingEngine] Callback error: {cb_err}")
+                if e_match and l_match and progress_callback:
+                    try:
+                        progress_callback(last_epoch, last_loss)
+                    except Exception as cb_err:
+                        print(f"[TrainingEngine] Callback error: {cb_err}")
 
-            # Honour stop request between epochs
-            if self._stop_requested and e_match:
-                print("[TrainingEngine] Stop requested — terminating after epoch.")
-                with self._lock:
-                    if self._process and self._process.poll() is None:
-                        self._process.terminate()
-                break
+                # Honour stop request between epochs
+                if self._stop_requested and e_match:
+                    print("[TrainingEngine] Stop requested — terminating after epoch.")
+                    with self._lock:
+                        if self._process and self._process.poll() is None:
+                            self._process.terminate()
+                    break
 
-        self._process.wait()
-        ret = self._process.returncode
+            self._process.wait()
+        finally:
+            with self._lock:
+                if self._process and self._process.poll() is None:
+                    self._process.terminate()
+                    try:
+                        self._process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._process.kill()
+
+        ret = self._process.returncode if self._process else -1
         with self._lock:
             self._process = None
 
@@ -172,6 +182,9 @@ class TrainingEngine:
             raise RuntimeError(f"Training exited with code {ret}")
 
         final_path = self._find_latest_checkpoint(model_name)
+        if not os.path.exists(final_path):
+            raise RuntimeError(f"Training finished but checkpoint was not created: {final_path}")
+
         print(f"[TrainingEngine] Done. Checkpoint: {final_path}")
         return final_path
 

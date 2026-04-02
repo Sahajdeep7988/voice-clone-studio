@@ -66,11 +66,6 @@ class AudioPreprocessor:
             {segment_paths, total_duration_minutes, segment_count, quality_label,
              manifest_path, total_files, success_count, failed_count, failures}
         """
-        # Only assert existence here; format/content errors are isolated per-file
-        for fp in file_paths:
-            if not os.path.exists(fp):
-                raise PreprocessingError(f"File not found: {fp}")
-
         workers   = min(max_workers, len(file_paths))
         successes = []
         failures  = []
@@ -146,6 +141,9 @@ class AudioPreprocessor:
         t0 = time.perf_counter()
 
         try:
+            if not os.path.exists(fp):
+                raise PreprocessingError(f"File not found: {fp}")
+
             # Format check — fail fast per-file, not globally
             ext = Path(fp).suffix.lower()
             if ext not in self.SUPPORTED_FORMATS:
@@ -187,33 +185,36 @@ class AudioPreprocessor:
             return json.load(f)
 
     def approve_segments(self, approved_paths: list) -> int:
-        segs         = self.get_segments()
-        approved_set = set(os.path.abspath(p) for p in approved_paths)
-        for seg in segs:
-            seg["approved"] = os.path.abspath(seg["path"]) in approved_set
-        self._save_manifest(segs)
-        count = sum(1 for s in segs if s["approved"])
-        print(f"[Preprocess] {count}/{len(segs)} segments approved.")
-        return count
+        with self._manifest_lock:
+            segs         = self.get_segments()
+            approved_set = set(os.path.abspath(p) for p in approved_paths)
+            for seg in segs:
+                seg["approved"] = os.path.abspath(seg["path"]) in approved_set
+            self._save_manifest(segs)
+            count = sum(1 for s in segs if s["approved"])
+            print(f"[Preprocess] {count}/{len(segs)} segments approved.")
+            return count
 
     def approve_all(self) -> int:
-        segs = self.get_segments()
-        for seg in segs:
-            seg["approved"] = True
-        self._save_manifest(segs)
-        return len(segs)
+        with self._manifest_lock:
+            segs = self.get_segments()
+            for seg in segs:
+                seg["approved"] = True
+            self._save_manifest(segs)
+            return len(segs)
 
     def delete_segment(self, path: str) -> bool:
-        abs_path = os.path.abspath(path)
-        segs     = self.get_segments()
-        new_segs = [s for s in segs if os.path.abspath(s["path"]) != abs_path]
-        if len(new_segs) == len(segs):
-            return False
-        if os.path.exists(abs_path):
-            os.remove(abs_path)
-        self._save_manifest(new_segs)
-        print(f"[Preprocess] Deleted segment: {path}")
-        return True
+        with self._manifest_lock:
+            abs_path = os.path.abspath(path)
+            segs     = self.get_segments()
+            new_segs = [s for s in segs if os.path.abspath(s["path"]) != abs_path]
+            if len(new_segs) == len(segs):
+                return False
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+            self._save_manifest(new_segs)
+            print(f"[Preprocess] Deleted segment: {path}")
+            return True
 
     def get_approved_segment_paths(self) -> list:
         return [s["path"] for s in self.get_segments() if s.get("approved", True)]
@@ -227,7 +228,7 @@ class AudioPreprocessor:
         fhash    = hashlib.md5(os.path.abspath(input_path).encode()).hexdigest()[:8]
         out_path = os.path.join(self.raw_dir, f"{stem}_{fhash}.wav")
 
-        if os.path.exists(out_path):
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return out_path
 
         cmd = [
@@ -255,7 +256,7 @@ class AudioPreprocessor:
         stem       = Path(wav_path).stem
         vocal_path = os.path.join(self.vocals_dir, f"{stem}_vocals.wav")
 
-        if os.path.exists(vocal_path):
+        if os.path.exists(vocal_path) and os.path.getsize(vocal_path) > 0:
             return vocal_path
 
         if self._demucs_model is None:
@@ -273,7 +274,10 @@ class AudioPreprocessor:
         model = self._demucs_model
         wav   = load_track(wav_path, model.audio_channels, model.samplerate)
         ref   = wav.mean(0)
-        wav   = (wav - ref.mean()) / ref.std()
+        std   = ref.std()
+        if std == 0.0:
+            std = 1e-8
+        wav   = (wav - ref.mean()) / std
 
         with torch.no_grad():
             sources = apply_model(
