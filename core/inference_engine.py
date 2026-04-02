@@ -52,27 +52,37 @@ class InferenceEngine:
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-        converter = self._get_converter()
-        converter.convert_audio(
-            audio_input_path=input_audio_path,
-            audio_output_path=output_path,
-            model_path=model_path,
-            index_path=self._find_index(model_path),
-            pitch=pitch_shift,
-            f0_method="rmvpe",
-            index_rate=0.75,
-            volume_envelope=1.0,
-            protect=0.5,
-            hop_length=128,
-            split_audio=False,
-            f0_autotune=False,
-            embedder_model="contentvec",
-            clean_audio=True,
-            export_format="WAV",
-            post_process=False,
-            resample_sr=0,
-            sid=0,
-        )
+        # Applio uses relative paths (e.g. 'rvc/models/predictors/rmvpe.pt')
+        # for lazy-loaded resources during conversion, so we must run from
+        # APPLIO_ROOT for the entire duration of the convert call.
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(_APPLIO_ROOT)
+            converter = self._get_converter()
+            converter.convert_audio(
+                audio_input_path=os.path.abspath(os.path.join(old_cwd, input_audio_path))
+                    if not os.path.isabs(input_audio_path) else input_audio_path,
+                audio_output_path=os.path.abspath(os.path.join(old_cwd, output_path))
+                    if not os.path.isabs(output_path) else output_path,
+                model_path=os.path.abspath(model_path),
+                index_path=self._find_index(model_path),
+                pitch=pitch_shift,
+                f0_method="rmvpe",
+                index_rate=0.75,
+                volume_envelope=1.0,
+                protect=0.5,
+                hop_length=128,
+                split_audio=False,
+                f0_autotune=False,
+                embedder_model="contentvec",
+                clean_audio=True,
+                export_format="WAV",
+                post_process=False,
+                resample_sr=0,
+                sid=0,
+            )
+        finally:
+            os.chdir(old_cwd)
 
         print(f"[Inference] Converted: {input_audio_path} → {output_path}")
         return os.path.abspath(output_path)
@@ -94,7 +104,11 @@ class InferenceEngine:
         if self._converter is not None:
             return self._converter
 
+        # VoiceConverter's Config() opens 'rvc/configs/48000.json' as a
+        # relative path, so we must run from APPLIO_ROOT (e.g. ./rvc/).
+        old_cwd = os.getcwd()
         try:
+            os.chdir(_APPLIO_ROOT)
             from rvc.infer.infer import VoiceConverter
             self._converter = VoiceConverter()
             return self._converter
@@ -104,6 +118,8 @@ class InferenceEngine:
                 "Ensure Applio's rvc/ directory is on PYTHONPATH or cloned "
                 "alongside this project at ./rvc/"
             )
+        finally:
+            os.chdir(old_cwd)
 
     def _find_index(self, model_path: str) -> str:
         """
