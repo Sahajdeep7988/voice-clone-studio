@@ -94,6 +94,15 @@ class SupabaseClient:
     def sync_training_session(self, metadata: dict) -> bool:
         try:
             client = self._get_client()
+
+            # Bug-fixes vs original:
+            #   1. on_conflict now targets session_id (the actual UNIQUE column).
+            #      The old target (user_id,model_name,created_at) had no UNIQUE
+            #      constraint, so every call was a blind INSERT that silently failed.
+            #   2. created_at is excluded from the upsert record so the DB default
+            #      (NOW()) is used on INSERT and the value is never overwritten on
+            #      subsequent UPDATE syncs.  Sending it would reset the creation
+            #      timestamp to the current time on every training-complete event.
             record = {
                 "user_id":          metadata.get("user_id", self._user_id),
                 "model_name":       metadata.get("model_name", ""),
@@ -103,14 +112,12 @@ class SupabaseClient:
                 "hardware_profile": metadata.get("hardware_profile", {}),
                 "session_id":       metadata.get("session_id"),
                 "checkpoint_path":  metadata.get("checkpoint_path"),
-                "created_at":       metadata.get(
-                    "created_at",
-                    datetime.now(timezone.utc).isoformat(),
-                ),
+                # created_at intentionally omitted — DB DEFAULT handles first INSERT;
+                # updated_at is auto-maintained by the fn_set_updated_at() trigger.
             }
             response = (
                 client.table("training_sessions")
-                .upsert(record, on_conflict="user_id,model_name,created_at")
+                .upsert(record, on_conflict="session_id")
                 .execute()
             )
             if response.data:
