@@ -8,7 +8,7 @@ Train a custom voice model from audio samples and convert any speech to that voi
 ## What it does
 
 1. **Preprocesses** audio/video files — converts to WAV, isolates vocals with Demucs, and splits into clean segments using WebRTC VAD.
-2. **Configures** training hyperparameters using a local Gemma 3 1B model (via Ollama) that reads your hardware specs — with a deterministic fallback if Ollama is unavailable.
+2. **Configures** training hyperparameters using a lightweight local Gemma-based model (GGUF format) executed via llama.cpp — with a deterministic fallback for reliability.
 3. **Trains** an RVC voice model as a managed subprocess, streaming epoch/loss progress in real time and saving checkpoints.
 4. **Converts** any audio to the cloned voice using the trained model.
 5. **Syncs** training session metadata to Supabase (optional) for cross-device history.
@@ -19,16 +19,15 @@ Train a custom voice model from audio samples and convert any speech to that voi
 
 ## Hardware Requirements
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
+| Component | Minimum                               | Recommended                     |
+| --------- | ------------------------------------- | ------------------------------- |
 | GPU VRAM  | None (CPU training possible but slow) | 6 GB+ (NVIDIA CUDA or AMD ROCm) |
-| RAM       | 8 GB    | 16 GB+      |
-| Disk      | 5 GB free | 20 GB+ for datasets and models |
-| CPU       | 4 cores | 8 cores+    |
+| RAM       | 8 GB                                  | 16 GB+                          |
+| Disk      | 5 GB free                             | 20 GB+ for datasets and models  |
+| CPU       | 4 cores                               | 8 cores+                        |
 
-- CUDA 12.x recommended for GPU training
-- FFmpeg must be installed system-wide (`sudo apt install ffmpeg`)
-- Ollama must be running locally for LLM-assisted hyperparameter selection
+* CUDA 12.x recommended for GPU training
+* FFmpeg must be installed system-wide (`sudo apt install ffmpeg`)
 
 ---
 
@@ -42,12 +41,16 @@ cd voice-clone-studio
 pip install -r requirements.txt
 ```
 
+---
+
 ### 2. Install PyTorch with CUDA (recommended)
 
 ```bash
 pip install torch==2.7.1+cu128 torchaudio==2.7.1+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
 ```
+
+---
 
 ### 3. Install FFmpeg
 
@@ -59,13 +62,18 @@ sudo apt install ffmpeg
 brew install ffmpeg
 ```
 
-### 4. Set up Ollama (optional, for LLM hyperparameter selection)
+---
 
-```bash
-# Install Ollama: https://ollama.com
-ollama pull gemma3:1b
-ollama serve
-```
+### 4. Local LLM Setup (Automatic)
+
+The system uses a lightweight local language model (Gemma-based GGUF format) for hyperparameter generation.
+
+* No external server required
+* No authentication required
+* Model is automatically downloaded on first run
+* Runs fully offline after download
+
+---
 
 ### 5. Configure Supabase (optional)
 
@@ -74,11 +82,14 @@ cp .env.example .env
 # Edit .env and fill in your SUPABASE_URL and SUPABASE_KEY
 ```
 
+---
+
 ### 6. Clone RVC dependencies (Applio)
 
 ```bash
 git clone https://github.com/IAHispano/Applio rvc
 pip install -r rvc/requirements.txt
+
 # Download pretrained weights:
 mkdir -p ~/VoiceClone/pretrained
 # Place f0G48k.pth and f0D48k.pth in ~/VoiceClone/pretrained/
@@ -94,6 +105,8 @@ mkdir -p ~/VoiceClone/pretrained
 python pipeline.py --files audio.mp3 --model-name myvoice
 ```
 
+---
+
 ### With multiple input files
 
 ```bash
@@ -101,12 +114,16 @@ python pipeline.py --files speech1.wav interview.mp4 podcast.mp3 \
                    --model-name myvoice
 ```
 
+---
+
 ### With Supabase sync
 
 ```bash
 python pipeline.py --files audio.mp3 --model-name myvoice \
                    --email user@example.com --password yourpassword
 ```
+
+---
 
 ### Inference only (after training)
 
@@ -130,12 +147,13 @@ engine.convert(
 voice-clone-studio/
 ├── core/
 │   ├── preprocessing.py     # FFmpeg + Demucs + WebRTC VAD
-│   ├── llm_config.py        # Ollama Gemma 3 1B hyperparameter selection
+│   ├── llm_config.py        # Local LLM (llama.cpp) hyperparameter generation + fallback
 │   ├── training_engine.py   # RVC training subprocess wrapper
 │   └── inference_engine.py  # Audio-to-audio voice conversion
 ├── services/
 │   └── supabase_client.py   # Auth + training session sync
 ├── pipeline.py              # CLI runner — connects all modules
+├── models/                  # Local GGUF LLM models (auto-downloaded)
 ├── requirements.txt
 ├── .env.example
 └── PROGRESS.md
@@ -151,7 +169,25 @@ MP3, WAV, FLAC, MP4, MKV
 
 ## Notes
 
-- Models, datasets, and logs are gitignored — they stay on your machine.
-- `.env` is never committed — credentials stay local.
-- Minimum dataset duration: **5 minutes** of clean speech after preprocessing.
-- Recommended: 10–20 minutes for an "Acceptable" quality model, 20+ for "Optimal".
+* Models, datasets, and logs are gitignored — they stay on your machine.
+* `.env` is never committed — credentials stay local.
+* Minimum dataset duration: **5 minutes** of clean speech after preprocessing.
+* Recommended: 10–20 minutes for acceptable quality, 20+ minutes for optimal results.
+* Hyperparameter generation uses a hybrid approach: local LLM inference + rule-based fallback for deterministic reliability.
+
+---
+
+## Author
+
+**Sahajdeep Singh**
+Student, Bachelor of Technology (B.Tech), Computer Science
+Amity University, Mohali, Punjab
+*Expected Graduation: 2028*
+Contact: [sahajdeepsingh404@gmail.com](mailto:sahajdeepsingh404@gmail.com)
+
+---
+
+## Acknowledgments
+
+Special thanks to the [Applio](https://github.com/IAHispano/Applio) repository by IAHispano.
+This project heavily relies on their excellent work on the Retrieval-based Voice Conversion (RVC) pipeline.
