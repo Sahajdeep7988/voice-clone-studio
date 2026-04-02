@@ -1,0 +1,56 @@
+# Voice Clone Studio — Python Dependencies
+# Cross-referenced with Applio's requirements.txt for RVC compatibility
+
+# ── PyTorch (CUDA 12.8, Linux/Windows) ──────────────────────────────────────
+# Install via: pip install torch==2.7.1+cu128 torchaudio==2.7.1+cu128 \
+#              --index-url https://download.pytorch.org/whl/cu128
+# For CPU-only: pip install torch==2.7.1 torchaudio==2.7.1
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# ── Core Audio & ML ──────────────────────────────────────────────────────────
+librosa==0.11.0
+scipy>=1.10.0
+soundfile==0.12.1
+numpy>=1.24.0
+faiss-cpu==1.13.2
+numba>=0.57.0
+
+# ── Audio Preprocessing ──────────────────────────────────────────────────────
+ffmpeg-python>=0.2.0
+demucs>=4.0.0
+webrtcvad-wheels>=2.0.10      # WebRTC VAD (pre-built wheels)
+noisereduce>=2.0.0
+pedalboard>=0.7.0
+soxr>=0.3.0
+
+# ── RVC / Voice Conversion ───────────────────────────────────────────────────
+torchcrepe>=0.0.20            # CREPE F0 extraction
+torchfcpe>=0.0.4              # FCPE F0 extraction
+transformers==4.44.2          # HuBERT embedder
+einops>=0.6.0                 # Tensor ops used by RVC models
+stftpitchshift>=1.5.0         # Pitch manipulation
+
+# ── LLM / Ollama ─────────────────────────────────────────────────────────────
+requests>=2.31.0              # HTTP calls to Ollama API
+
+# ── Supabase ─────────────────────────────────────────────────────────────────
+supabase>=2.0.0
+python-dotenv>=1.0.0
+
+# ── UI (next phase — PyQt6 dashboard) ───────────────────────────────────────
+PyQt6>=6.5.0
+pyqtgraph>=0.13.0
+
+# ── ML Utilities ─────────────────────────────────────────────────────────────
+omegaconf>=2.3.0
+tqdm>=4.65.0
+tensorboard>=2.13.0
+tensorboardX>=2.6.0
+matplotlib>=3.7.0
+setuptools>=68.0.0
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+certifi>=2023.07.22
+sounddevice>=0.4.6
+antlr4-python3-runtime==4.8
