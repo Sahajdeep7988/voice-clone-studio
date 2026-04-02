@@ -146,8 +146,35 @@ class SupabaseClient:
         return self._user_id
 
     @property
+    def access_token(self) -> str | None:
+        """The current in-memory JWT access token."""
+        return self._token
+
+    @property
     def is_authenticated(self) -> bool:
         return self._token is not None
+
+    def get_user_by_token(self, token: str) -> dict | None:
+        """
+        Validate a JWT and return the user's public info.
+        Used by GET /auth/me to authenticate stateless API requests.
+        Returns None if the token is invalid or expired.
+        """
+        try:
+            client   = self._get_client()
+            response = client.auth.get_user(token)
+            if response and response.user:
+                u = response.user
+                return {
+                    "id":         u.id,
+                    "email":      u.email,
+                    "role":       u.role or "authenticated",
+                    "created_at": str(u.created_at),
+                }
+            return None
+        except Exception as e:
+            print(f"[Supabase] get_user_by_token failed: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Helpers
