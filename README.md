@@ -155,3 +155,19 @@ MP3, WAV, FLAC, MP4, MKV
 - `.env` is never committed — credentials stay local.
 - Minimum dataset duration: **5 minutes** of clean speech after preprocessing.
 - Recommended: 10–20 minutes for an "Acceptable" quality model, 20+ for "Optimal".
+
+---
+
+## Author
+
+**Sahajdeep Singh**
+Student, Bachelor of Technology (B.Tech), Computer Science
+Amity University, Mohali, Punjab
+*Expected Graduation: 2028*
+Contact: [sahajdeepsingh404@gmail.com](mailto:sahajdeepsingh404@gmail.com)
+
+---
+
+## Acknowledgments
+
+Special thanks to the **[Applio](https://github.com/IAHispano/Applio)** repository by IAHispano. This project heavily relies on their excellent work on the Retrieval-based Voice Conversion (RVC) pipeline.
