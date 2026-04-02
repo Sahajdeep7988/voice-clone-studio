@@ -11,10 +11,10 @@ from pathlib import Path
 
 MODELS_BASE = os.path.expanduser("~/VoiceClone/models")
 
-# Allow importing rvc modules if Applio is cloned alongside this project
-_APPLIO_ROOT = os.path.join(os.path.dirname(__file__), "..", "rvc")
+# Applio is cloned at rvc/ — add it to sys.path so `from rvc.infer.infer import ...` works
+_APPLIO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rvc"))
 if os.path.isdir(_APPLIO_ROOT) and _APPLIO_ROOT not in sys.path:
-    sys.path.insert(0, os.path.dirname(_APPLIO_ROOT))
+    sys.path.insert(0, _APPLIO_ROOT)
 
 
 class InferenceEngine:

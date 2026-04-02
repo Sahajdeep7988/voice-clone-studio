@@ -104,32 +104,61 @@ class AudioPreprocessor:
         return out_path
 
     # ------------------------------------------------------------------
-    # Step 2: Demucs vocal isolation
+    # Step 2: Demucs vocal isolation (Python API — avoids torchaudio.save)
     # ------------------------------------------------------------------
 
     def _demucs_isolate(self, wav_path: str) -> str:
+        import torch
+        import soundfile as sf
+        from demucs.separate import load_track, get_model_from_args
+        from demucs.apply import apply_model
+        import argparse
+
         stem = Path(wav_path).stem
-        # Demucs outputs to: {output_dir}/htdemucs/{stem}/vocals.wav
-        out_dir = self.VOCALS_DIR
-        cmd = [
-            "python", "-m", "demucs",
-            "--two-stems", "vocals",
-            "-n", "htdemucs",
-            "-o", out_dir,
-            wav_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise PreprocessingError(
-                f"Demucs failed for {wav_path}:\n{result.stderr}"
-            )
+        vocal_path = os.path.join(self.VOCALS_DIR, f"{stem}_vocals.wav")
 
-        vocal_path = os.path.join(out_dir, "htdemucs", stem, "vocals.wav")
-        if not os.path.exists(vocal_path):
-            raise PreprocessingError(
-                f"Demucs output not found at expected path: {vocal_path}"
-            )
+        print(f"[Preprocess] Loading htdemucs model...")
+        # Build a minimal args namespace matching demucs internals
+        args = argparse.Namespace(
+            name="htdemucs",
+            repo=None,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            shifts=1,
+            overlap=0.25,
+            no_split=False,
+            segment=None,
+            jobs=0,
+            verbose=False,
+            stem="vocals",
+        )
+        model = get_model_from_args(args)
+        model.eval()
+        if torch.cuda.is_available():
+            model.cuda()
 
+        print(f"[Preprocess] Separating vocals: {wav_path}")
+        wav = load_track(wav_path, model.audio_channels, model.samplerate)
+        ref = wav.mean(0)
+        wav = (wav - ref.mean()) / ref.std()
+
+        with torch.no_grad():
+            sources = apply_model(
+                model, wav[None],
+                device=args.device,
+                shifts=args.shifts,
+                split=not args.no_split,
+                overlap=args.overlap,
+                progress=True,
+            )[0]
+
+        sources = sources * ref.std() + ref.mean()
+
+        # Extract vocals stem and save with soundfile (no torchaudio needed)
+        vocal_idx = model.sources.index("vocals")
+        vocal_tensor = sources[vocal_idx]                   # [channels, samples]
+        vocal_np = vocal_tensor.cpu().numpy().T             # [samples, channels]
+
+        sf.write(vocal_path, vocal_np, model.samplerate, subtype="PCM_16")
         print(f"[Preprocess] Vocals isolated: {vocal_path}")
         return vocal_path
 
