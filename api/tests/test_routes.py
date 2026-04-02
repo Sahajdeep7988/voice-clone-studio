@@ -31,7 +31,7 @@ from api.tests.conftest import (
     make_mock_prepare_engine,
     parse_sse,
     DEFAULT_HYPERPARAMS,
-    TEST_MP3, TEST_WAV, TEST_MKV, TEST_MP4, TEST_WEBM,
+    TEST_MP3, TEST_WAV, TEST_MKV, TEST_MP4, TEST_WEBM, TMP_MODEL,
 )
 
 
@@ -57,13 +57,12 @@ class TestListSessions:
     def test_filter_by_user_id(self, client, mock_backend):
         mock_backend.list_sessions.return_value = {"ok": True, "sessions": []}
         r = client.get("/sessions?user_id=user-42")
-        assert r.status_code == 200
-        mock_backend.list_sessions.assert_called_once_with(user_id="user-42")
+        assert r.status_code == 403
 
     def test_no_user_id_passes_none(self, client, mock_backend):
         mock_backend.list_sessions.return_value = {"ok": True, "sessions": []}
         client.get("/sessions")
-        mock_backend.list_sessions.assert_called_once_with(user_id=None)
+        mock_backend.list_sessions.assert_called_once_with(user_id="user-1")
 
     def test_session_fields_present(self, client, mock_backend):
         s = make_session()
@@ -168,32 +167,32 @@ class TestInferenceConvert:
 
     def test_success(self, client, mock_backend):
         mock_backend.convert_audio.return_value = {
-            "ok": True, "output_path": "/out/converted.wav"
+            "ok": True, "output_path": "/tmp/out/converted.wav"
         }
         r = client.post("/inference/convert", json={
-            "model_path":       "/models/myvoice.pth",
+            "model_path":       TMP_MODEL,
             "input_audio_path": TEST_WAV,
-            "output_path":      "/out/result.wav",
+            "output_path":      "/tmp/out/result.wav",
         })
         assert r.status_code == 200
-        assert r.json()["output_path"] == "/out/converted.wav"
+        assert r.json()["output_path"] == "/tmp/out/converted.wav"
 
     def test_pitch_shift_default_zero(self, client, mock_backend):
-        mock_backend.convert_audio.return_value = {"ok": True, "output_path": "/out/x.wav"}
+        mock_backend.convert_audio.return_value = {"ok": True, "output_path": "/tmp/out/x.wav"}
         client.post("/inference/convert", json={
-            "model_path":       "/m.pth",
+            "model_path":       TMP_MODEL,
             "input_audio_path": TEST_WAV,
-            "output_path":      "/o.wav",
+            "output_path":      "/tmp/o.wav",
         })
         _, kwargs = mock_backend.convert_audio.call_args
         assert kwargs.get("pitch_shift", 0) == 0
 
     def test_custom_pitch_shift(self, client, mock_backend):
-        mock_backend.convert_audio.return_value = {"ok": True, "output_path": "/out/x.wav"}
+        mock_backend.convert_audio.return_value = {"ok": True, "output_path": "/tmp/out/x.wav"}
         client.post("/inference/convert", json={
-            "model_path":       "/m.pth",
+            "model_path":       TMP_MODEL,
             "input_audio_path": TEST_WAV,
-            "output_path":      "/o.wav",
+            "output_path":      "/tmp/o.wav",
             "pitch_shift":      5,
         })
         _, kwargs = mock_backend.convert_audio.call_args
@@ -204,29 +203,29 @@ class TestInferenceConvert:
             "ok": False, "error": "Model file not found"
         }
         r = client.post("/inference/convert", json={
-            "model_path":       "/missing.pth",
+            "model_path":       TMP_MODEL,
             "input_audio_path": TEST_WAV,
-            "output_path":      "/o.wav",
+            "output_path":      "/tmp/o.wav",
         })
         assert r.status_code == 500
         assert "not found" in r.json()["detail"].lower()
 
     def test_missing_required_fields(self, client, mock_backend):
-        r = client.post("/inference/convert", json={"model_path": "/m.pth"})
+        r = client.post("/inference/convert", json={"model_path": TMP_MODEL})
         assert r.status_code == 422
 
     def test_all_fields_forwarded(self, client, mock_backend):
-        mock_backend.convert_audio.return_value = {"ok": True, "output_path": "/o.wav"}
+        mock_backend.convert_audio.return_value = {"ok": True, "output_path": "/tmp/o.wav"}
         client.post("/inference/convert", json={
-            "model_path":       "/models/v.pth",
+            "model_path":       TMP_MODEL,
             "input_audio_path": TEST_MP3,
-            "output_path":      "/out/v.wav",
+            "output_path":      "/tmp/out/v.wav",
             "pitch_shift":      -3,
         })
         mock_backend.convert_audio.assert_called_once_with(
-            model_path="/models/v.pth",
+            model_path=TMP_MODEL,
             input_audio_path=TEST_MP3,
-            output_path="/out/v.wav",
+            output_path="/tmp/out/v.wav",
             pitch_shift=-3,
         )
 
@@ -617,7 +616,7 @@ class TestConfirmSession:
         assert names[-1] in ("complete", "error")
 
     def test_error_when_session_not_found(self, client, mock_prepare_engine):
-        async def _not_found(session_id, hyperparams_override=None):
+        async def _not_found(session_id, hyperparams_override=None, **_):
             yield (
                 f"event: error\n"
                 f"data: {json.dumps({'ok': False, 'error': 'Session not found'})}\n\n"
@@ -632,7 +631,7 @@ class TestConfirmSession:
         assert err["data"]["ok"] is False
 
     def test_error_when_wrong_status(self, client, mock_prepare_engine):
-        async def _wrong_status(session_id, hyperparams_override=None):
+        async def _wrong_status(session_id, hyperparams_override=None, **_):
             yield (
                 f"event: error\n"
                 f"data: {json.dumps({'ok': False, 'error': 'Cannot confirm — status is training'})}\n\n"
@@ -936,7 +935,7 @@ class TestScenarios:
                 "ok": True, "session_id": sid, "hyperparams": hp
             }
 
-            async def _fake_stream(session_id, hyperparams_override=None):
+            async def _fake_stream(session_id, hyperparams_override=None, **_):
                 yield f"event: training_started\ndata: {json.dumps({'session_id': session_id})}\n\n"
                 yield f"event: complete\ndata: {json.dumps({'session_id': session_id, 'status': 'done', 'checkpoint_path': '/rvc/logs/v.pth', 'error_message': None})}\n\n"
             mpe.confirm_and_stream.side_effect = _fake_stream

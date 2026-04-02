@@ -6,7 +6,6 @@ All network calls fail gracefully when offline.
 """
 
 import os
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,32 +17,33 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 class SupabaseClient:
 
     def __init__(self):
-        self._token:         str | None = None
-        self._refresh_token: str | None = None
-        self._user_id:       str | None = None
-        self._client        = None
+        self._client = None
 
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
 
-    def login(self, email: str, password: str) -> bool:
+    def login(self, email: str, password: str) -> dict:
         try:
             client   = self._get_client()
             response = client.auth.sign_in_with_password(
                 {"email": email, "password": password}
             )
             if response.session:
-                self._store_session(response)
                 print(f"[Supabase] Logged in as {email}")
-                return True
+                return {
+                    "ok": True,
+                    "user_id": response.user.id if response.user else None,
+                    "access_token": response.session.access_token,
+                    "refresh_token": response.session.refresh_token,
+                }
             print("[Supabase] Login failed: no session returned.")
-            return False
+            return {"ok": False}
         except Exception as e:
             print(f"[Supabase] Login failed (offline or error): {e}")
-            return False
+            return {"ok": False}
 
-    def register(self, email: str, password: str) -> bool:
+    def register(self, email: str, password: str) -> dict:
         try:
             client   = self._get_client()
             response = client.auth.sign_up(
@@ -51,31 +51,44 @@ class SupabaseClient:
             )
             if response.user:
                 print(f"[Supabase] Registered: {email}")
-                if response.session:
-                    self._store_session(response)
-                return True
+                return {
+                    "ok": True,
+                    "user_id": response.user.id,
+                    "access_token": response.session.access_token if response.session else None,
+                    "refresh_token": response.session.refresh_token if response.session else None,
+                }
             print("[Supabase] Registration failed.")
-            return False
+            return {"ok": False}
         except Exception as e:
             print(f"[Supabase] Registration failed: {e}")
-            return False
+            return {"ok": False}
 
     def logout(self) -> bool:
         try:
-            if self._client and self._token:
+            if self._client:
                 self._client.auth.sign_out()
         except Exception:
             pass
-        self._token         = None
-        self._refresh_token = None
-        self._user_id       = None
         print("[Supabase] Logged out.")
         return True
 
-    def refresh_token(self) -> bool:
-        """Refresh the JWT using the stored refresh token."""
-        if not self._refresh_token:
-            return False
+    def refresh_token(self, refresh_token: str | None) -> dict:
+        """Refresh a JWT using the provided refresh token."""
+        if not refresh_token:
+            return {"ok": False}
+        try:
+            client   = self._get_client()
+            response = client.auth.refresh_session(refresh_token)
+            if response.session:
+                return {
+                    "ok": True,
+                    "user_id": response.user.id if response.user else None,
+                    "access_token": response.session.access_token,
+                    "refresh_token": response.session.refresh_token,
+                }
+        except Exception as e:
+            print(f"[Supabase] Token refresh failed: {e}")
+        return {"ok": False}
         try:
             client   = self._get_client()
             response = client.auth.refresh_session(self._refresh_token)
@@ -91,9 +104,11 @@ class SupabaseClient:
     # Training session sync
     # ------------------------------------------------------------------
 
-    def sync_training_session(self, metadata: dict) -> bool:
+    def sync_training_session(self, metadata: dict, access_token: str | None = None) -> bool:
         try:
             client = self._get_client()
+            if access_token:
+                client.postgrest.auth(access_token)
 
             # Bug-fixes vs original:
             #   1. on_conflict now targets session_id (the actual UNIQUE column).
@@ -104,7 +119,7 @@ class SupabaseClient:
             #      subsequent UPDATE syncs.  Sending it would reset the creation
             #      timestamp to the current time on every training-complete event.
             record = {
-                "user_id":          metadata.get("user_id", self._user_id),
+                "user_id":          metadata.get("user_id"),
                 "model_name":       metadata.get("model_name", ""),
                 "status":           metadata.get("status", "completed"),
                 "duration_seconds": metadata.get("duration_seconds", 0),
@@ -148,19 +163,6 @@ class SupabaseClient:
     # Properties
     # ------------------------------------------------------------------
 
-    @property
-    def user_id(self) -> str | None:
-        return self._user_id
-
-    @property
-    def access_token(self) -> str | None:
-        """The current in-memory JWT access token."""
-        return self._token
-
-    @property
-    def is_authenticated(self) -> bool:
-        return self._token is not None
-
     def get_user_by_token(self, token: str) -> dict | None:
         """
         Validate a JWT and return the user's public info.
@@ -186,11 +188,6 @@ class SupabaseClient:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _store_session(self, response) -> None:
-        self._token         = response.session.access_token
-        self._refresh_token = response.session.refresh_token
-        self._user_id       = response.user.id
 
     def _get_client(self):
         if self._client is not None:

@@ -60,6 +60,7 @@ class PrepareEngine:
         model_name: str,
         max_workers: int = 4,
         resume: bool | None = None,
+        user_id: str | None = None,
     ) -> dict:
         """
         Run preprocessing + LLM hyperparameter generation.
@@ -73,23 +74,11 @@ class PrepareEngine:
         if resume is None:
             resume = len(TrainingEngine().get_checkpoint_list(model_name)) > 0
 
-        # Reuse an existing session dir when resuming.
-        session_id: str | None = None
-        if resume:
-            for s in self._b.sessions.find_by_model(model_name):
-                cid = s.get("session_id")
-                if not cid:
-                    continue
-                if os.path.isdir(os.path.join(self._b.base_dir, "sessions_data", cid)):
-                    session_id = cid
-                    break
-
-        if session_id is None:
-            session_id = self._b.sessions.create_session(
-                model_name=model_name,
-                files=files,
-                user_id=self._b.supabase.user_id,
-            )
+        session_id = self._b.sessions.create_session(
+            model_name=model_name,
+            files=files,
+            user_id=user_id,
+        )
 
         session_base = os.path.join(self._b.base_dir, "sessions_data", session_id)
         preprocessor = AudioPreprocessor(base_dir=session_base)
@@ -155,6 +144,8 @@ class PrepareEngine:
         self,
         session_id: str,
         hyperparams_override: dict | None = None,
+        user_id: str | None = None,
+        access_token: str | None = None,
     ):
         """
         Async generator yielding SSE strings.
@@ -171,6 +162,9 @@ class PrepareEngine:
         session = self._b.sessions.get_session(session_id)
         if not session:
             yield _sse("error", {"ok": False, "error": f"Session {session_id} not found"})
+            return
+        if user_id and session.get("user_id") and session.get("user_id") != user_id:
+            yield _sse("error", {"ok": False, "error": "Forbidden"})
             return
 
         allowed_statuses = {"awaiting_confirmation", "paused", "error"}
@@ -199,6 +193,8 @@ class PrepareEngine:
                 hyperparams_override=final_hyperparams,
                 async_mode=True,
                 resume=True,
+                user_id=user_id,
+                access_token=access_token,
             ),
         )
 
@@ -208,7 +204,7 @@ class PrepareEngine:
 
         yield _sse("training_started", {"session_id": session_id})
 
-        terminal = {"done", "error"}
+        terminal = {"done", "error", "paused"}
         last_epoch = -1
 
         while True:
@@ -243,8 +239,14 @@ class PrepareEngine:
                 )
 
             if status in terminal:
+                if status == "done":
+                    event = "complete"
+                elif status == "paused":
+                    event = "paused"
+                else:
+                    event = "error"
                 yield _sse(
-                    "complete" if status == "done" else "error",
+                    event,
                     {
                         "session_id":      session_id,
                         "status":          status,

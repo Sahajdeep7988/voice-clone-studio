@@ -57,12 +57,17 @@ def _make_supabase_mock(
     user_by_token: dict | None = None,
 ) -> MagicMock:
     sb = MagicMock()
-    sb.login.return_value              = login_ok
-    sb.register.return_value           = register_ok
+    sb.login.return_value              = {
+        "ok": login_ok,
+        "user_id": user_id if login_ok else None,
+        "access_token": token if login_ok else None,
+    }
+    sb.register.return_value           = {
+        "ok": register_ok,
+        "user_id": user_id if register_ok else None,
+        "access_token": token if register_ok else None,
+    }
     sb.logout.return_value             = True
-    sb.user_id                         = user_id if (login_ok or register_ok) else None
-    sb.access_token                    = token if login_ok else None
-    sb.is_authenticated                = login_ok
     sb.get_user_by_token.return_value  = (
         user_by_token if user_by_token is not None else (FAKE_USER if login_ok else None)
     )
@@ -120,7 +125,7 @@ class TestRegister:
 
     def test_duplicate_email_400(self, auth_client):
         client, sb = auth_client
-        sb.register.return_value = False
+        sb.register.return_value = {"ok": False}
         r = client.post("/auth/register", json={
             "email": "taken@example.com", "password": "Pass1234!"
         })
@@ -129,7 +134,7 @@ class TestRegister:
 
     def test_supabase_offline_400(self, auth_client):
         client, sb = auth_client
-        sb.register.return_value = False
+        sb.register.return_value = {"ok": False}
         r = client.post("/auth/register", json={
             "email": "x@x.com", "password": "abc123"
         })
@@ -159,7 +164,11 @@ class TestRegister:
 
     def test_user_id_returned_on_success(self, auth_client):
         client, sb = auth_client
-        sb.user_id = FAKE_USER_ID
+        sb.register.return_value = {
+            "ok": True,
+            "user_id": FAKE_USER_ID,
+            "access_token": FAKE_TOKEN,
+        }
         r = client.post("/auth/register", json={
             "email": "new@example.com", "password": "Pass123!"
         })
@@ -191,7 +200,7 @@ class TestLogin:
 
     def test_wrong_password_401(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = False
+        sb.login.return_value = {"ok": False}
         r = client.post("/auth/login", json={
             "email": "test@example.com", "password": "wrong"
         })
@@ -200,7 +209,7 @@ class TestLogin:
 
     def test_unknown_email_401(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = False
+        sb.login.return_value = {"ok": False}
         r = client.post("/auth/login", json={
             "email": "nobody@example.com", "password": "anything"
         })
@@ -208,7 +217,7 @@ class TestLogin:
 
     def test_supabase_offline_401(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = False
+        sb.login.return_value = {"ok": False}
         r = client.post("/auth/login", json={
             "email": "a@b.com", "password": "pw"
         })
@@ -216,7 +225,11 @@ class TestLogin:
 
     def test_token_in_response(self, auth_client):
         client, sb = auth_client
-        sb.access_token = "a.b.c"
+        sb.login.return_value = {
+            "ok": True,
+            "user_id": FAKE_USER_ID,
+            "access_token": "a.b.c",
+        }
         r = client.post("/auth/login", json={
             "email": "a@b.com", "password": "pw"
         })
@@ -239,7 +252,7 @@ class TestLogin:
 
     def test_no_token_on_failure(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = False
+        sb.login.return_value = {"ok": False}
         r = client.post("/auth/login", json={"email": "a@b.com", "password": "bad"})
         assert r.status_code == 401
         assert "token" not in r.json()

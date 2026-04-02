@@ -40,12 +40,10 @@ class AppBackend:
     # ------------------------------------------------------------------
 
     def login(self, email: str, password: str) -> dict:
-        ok = self.supabase.login(email, password)
-        return {"ok": ok, "user_id": self.supabase.user_id}
+        return self.supabase.login(email, password)
 
     def register(self, email: str, password: str) -> dict:
-        ok = self.supabase.register(email, password)
-        return {"ok": ok, "user_id": self.supabase.user_id}
+        return self.supabase.register(email, password)
 
     def logout(self) -> dict:
         self.supabase.logout()
@@ -63,6 +61,8 @@ class AppBackend:
         async_mode:           bool = False,
         max_workers:          int  = 4,
         resume:              bool | None = None,
+        user_id:             str | None = None,
+        access_token:        str | None = None,
     ) -> dict:
         """
         Start preprocessing -> config -> training.
@@ -76,28 +76,17 @@ class AppBackend:
             checkpoint_exists = len(TrainingEngine().get_checkpoint_list(model_name)) > 0
             resume = checkpoint_exists
 
-        if resume:
-            for s in self.sessions.find_by_model(model_name):
-                candidate_id = s.get("session_id")
-                if not candidate_id:
-                    continue
-                session_dir = os.path.join(self.base_dir, "sessions_data", candidate_id)
-                if os.path.isdir(session_dir):
-                    session_id = candidate_id
-                    print(f"[Session] Reusing existing session: {session_id}")
-                    break
-
         if session_id is None:
             session_id = self.sessions.create_session(
                 model_name=model_name,
                 files=files,
-                user_id=self.supabase.user_id,
+                user_id=user_id,
             )
 
         if async_mode:
             t = threading.Thread(
                 target=self._pipeline_worker,
-                args=(session_id, files, model_name, hyperparams_override, resume, max_workers),
+                args=(session_id, files, model_name, hyperparams_override, resume, max_workers, user_id, access_token),
                 daemon=True,
             )
             with self._lock:
@@ -107,10 +96,15 @@ class AppBackend:
 
         return self._pipeline_worker(
             session_id, files, model_name, hyperparams_override,
-            resume=resume, max_workers=max_workers,
+            resume=resume, max_workers=max_workers, user_id=user_id, access_token=access_token,
         )
 
-    def resume_pipeline(self, session_id: str, async_mode: bool = False) -> dict:
+    def resume_pipeline(
+        self,
+        session_id: str,
+        async_mode: bool = False,
+        access_token: str | None = None,
+    ) -> dict:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": f"Session {session_id} not found"}
@@ -122,7 +116,7 @@ class AppBackend:
         if async_mode:
             t = threading.Thread(
                 target=self._pipeline_worker,
-                args=(session_id, files, model_name, hyperparams, True),
+                args=(session_id, files, model_name, hyperparams, True, 4, session.get("user_id"), access_token),
                 daemon=True,
             )
             with self._lock:
@@ -130,7 +124,10 @@ class AppBackend:
             t.start()
             return {"ok": True, "session_id": session_id, "async": True}
 
-        return self._pipeline_worker(session_id, files, model_name, hyperparams, resume=True)
+        return self._pipeline_worker(
+            session_id, files, model_name, hyperparams, resume=True,
+            user_id=session.get("user_id"), access_token=access_token,
+        )
 
     # ------------------------------------------------------------------
     # Training control
@@ -140,9 +137,8 @@ class AppBackend:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
-        model_name = session["model_name"]
         with self._lock:
-            engine = self._engines.get(model_name)
+            engine = self._engines.get(session_id)
         if not engine:
             return {"ok": False, "error": "No active training engine"}
         if force:
@@ -150,7 +146,7 @@ class AppBackend:
         else:
             engine.stop_training()
         self.sessions.set_status(session_id, "paused")
-        checkpoint = engine.get_checkpoint_list(model_name)
+        checkpoint = engine.get_checkpoint_list(session["model_name"])
         latest     = checkpoint[-1] if checkpoint else None
         if latest:
             self.sessions.set_checkpoint(session_id, latest)
@@ -160,10 +156,9 @@ class AppBackend:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
-        model_name = session["model_name"]
         with self._lock:
-            engine = self._engines.get(model_name)
-        engine_status = engine.get_training_status(model_name) if engine else {}
+            engine = self._engines.get(session_id)
+        engine_status = engine.get_training_status(session["model_name"]) if engine else {}
         return {"ok": True, "session": session, "engine": engine_status}
 
     def list_sessions(self, user_id: str | None = None) -> dict:
@@ -326,6 +321,8 @@ class AppBackend:
         hyperparams_override: dict | None = None,
         resume:               bool        = False,
         max_workers:          int         = 4,
+        user_id:              str | None = None,
+        access_token:         str | None = None,
     ) -> dict:
         log   = get_logger(stage="pipeline")
         start = time.time()
@@ -411,7 +408,7 @@ class AppBackend:
             self.sessions.set_status(session_id, "training")
             engine = TrainingEngine()
             with self._lock:
-                self._engines[model_name] = engine
+                self._engines[session_id] = engine
 
             def on_progress(epoch: int, loss: float):
                 self.sessions.update_progress(session_id, epoch, loss)
@@ -432,9 +429,9 @@ class AppBackend:
             elapsed = int(time.time() - start)
 
             # ── Supabase sync ─────────────────────────────────────────
-            if self.supabase.is_authenticated:
+            if user_id and access_token:
                 self.supabase.sync_training_session({
-                    "user_id":          self.supabase.user_id,
+                    "user_id":          user_id,
                     "model_name":       model_name,
                     "status":           "completed",
                     "duration_seconds": elapsed,
@@ -443,7 +440,7 @@ class AppBackend:
                     "session_id":       session_id,
                     "checkpoint_path":  model_path,
                     "created_at":       datetime.now(timezone.utc).isoformat(),
-                })
+                }, access_token=access_token)
 
             log.success(f"Pipeline done: model_path={model_path} elapsed={elapsed}s")
             return {
@@ -469,7 +466,7 @@ class AppBackend:
             return {"ok": False, "error": str(e), "session_id": session_id}
         finally:
             with self._lock:
-                self._engines.pop(model_name, None)
+                self._engines.pop(session_id, None)
 
 
 # ------------------------------------------------------------------

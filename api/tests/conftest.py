@@ -26,6 +26,13 @@ TEST_WAV    = os.path.join(TEST_INPUTS, "test_audio_2.wav")
 TEST_MKV    = os.path.join(TEST_INPUTS, "test_video_1.mkv")
 TEST_MP4    = os.path.join(TEST_INPUTS, "test_video_1.mp4")
 TEST_WEBM   = os.path.join(TEST_INPUTS, "test_video_2.webm")
+TMP_MODEL  = "/tmp/test_model.pth"
+if not os.path.exists(TMP_MODEL):
+    try:
+        with open(TMP_MODEL, "wb") as f:
+            f.write(b"model")
+    except OSError:
+        pass
 
 # ── Canonical mock data ──────────────────────────────────────────────────────
 
@@ -84,8 +91,12 @@ def make_mock_backend(
     sl = sessions or [s]
 
     mb = MagicMock()
-    mb.supabase.user_id = "user-1"
-    mb.supabase.is_authenticated = False
+    mb.supabase.get_user_by_token.return_value = {
+        "id": "user-1",
+        "email": "user-1@example.com",
+        "role": "authenticated",
+        "created_at": "2026-04-02T10:00:00+00:00",
+    }
     mb.base_dir = ROOT
 
     # Sessions sub-object
@@ -141,7 +152,7 @@ def make_mock_prepare_engine(
         "hyperparams": s["hyperparams"],
     }
 
-    async def _fake_confirm_stream(session_id, hyperparams_override=None):
+    async def _fake_confirm_stream(session_id, hyperparams_override=None, **_):
         yield "event: training_started\ndata: " + json.dumps({"session_id": session_id}) + "\n\n"
         for epoch in (10, 25, 50):
             d = {"session_id": session_id, "status": "training",
@@ -177,4 +188,5 @@ def client(mock_backend, mock_prepare_engine):
          patch("api.two_step_router._engine", mock_prepare_engine):
         from api.app import app
         with TestClient(app, raise_server_exceptions=True) as c:
+            c.headers.update({"Authorization": "Bearer test.token.value"})
             yield c

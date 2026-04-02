@@ -14,7 +14,7 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -24,6 +24,54 @@ app = FastAPI(title="Voice Clone Studio API", version="1.0.0")
 
 # One backend instance per process — sessions survive across requests.
 _backend = AppBackend(base_dir=_ROOT)
+
+
+# ---------------------------------------------------------------------------
+# Auth + Path Safety
+# ---------------------------------------------------------------------------
+
+_SAFE_DIRS = [
+    os.path.abspath(os.path.join(_ROOT, "sessions_data")),
+    os.path.abspath(os.path.join(_ROOT, "test_inputs")),
+    os.path.expanduser("~/voice-clone-studio"),
+    os.path.expanduser("~/Desktop/voice-clone-studio"),
+    os.path.expanduser("~/VoiceClone"),
+    os.path.expanduser("~/.voice_clone_studio"),
+    "/tmp",
+]
+
+
+def _ensure_safe_path(path: str, allow_missing: bool = False) -> str:
+    abs_path = os.path.abspath(path)
+    if not allow_missing and not os.path.exists(abs_path):
+        raise HTTPException(status_code=400, detail=f"Path not found: {path}")
+    for base in _SAFE_DIRS:
+        base_abs = os.path.abspath(base)
+        try:
+            if os.path.commonpath([abs_path, base_abs]) == base_abs:
+                return abs_path
+        except ValueError:
+            continue
+    raise HTTPException(status_code=403, detail=f"Path not allowed: {path}")
+
+
+def _get_token(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or malformed Authorization header. Expected: Bearer <token>",
+        )
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty token.")
+    return token
+
+
+def get_current_user(token: str = Depends(_get_token)) -> dict:
+    user = _backend.supabase.get_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    return {"id": user["id"], "token": token}
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +113,8 @@ async def _stream_pipeline(
     hyperparams_override: Optional[dict],
     max_workers: int,
     resume: Optional[bool],
+    user_id: Optional[str],
+    access_token: Optional[str],
 ):
     """
     Generator that:
@@ -85,6 +135,8 @@ async def _stream_pipeline(
             async_mode=True,
             max_workers=max_workers,
             resume=resume,
+            user_id=user_id,
+            access_token=access_token,
         ),
     )
 
@@ -95,7 +147,7 @@ async def _stream_pipeline(
     session_id: str = result["session_id"]
     yield _sse("session_created", {"session_id": session_id})
 
-    terminal_states = {"done", "error"}
+    terminal_states = {"done", "error", "paused"}
     last_epoch = -1
 
     while True:
@@ -131,7 +183,12 @@ async def _stream_pipeline(
             )
 
         if status in terminal_states:
-            event_name = "complete" if status == "done" else "error"
+            if status == "done":
+                event_name = "complete"
+            elif status == "paused":
+                event_name = "paused"
+            else:
+                event_name = "error"
             yield _sse(
                 event_name,
                 {
@@ -149,7 +206,7 @@ async def _stream_pipeline(
 # ---------------------------------------------------------------------------
 
 @app.post("/sessions/create")
-async def create_session(body: CreateSessionRequest):
+async def create_session(body: CreateSessionRequest, current=Depends(get_current_user)):
     """
     Start a new training pipeline.
     Returns an SSE stream with events:
@@ -158,13 +215,16 @@ async def create_session(body: CreateSessionRequest):
       - complete         {"session_id", "status", "checkpoint_path"}
       - error            {"ok": false, "error": "..."}
     """
+    safe_files = [_ensure_safe_path(p) for p in body.files]
     return StreamingResponse(
         _stream_pipeline(
-            files=body.files,
+            files=safe_files,
             model_name=body.model_name,
             hyperparams_override=body.hyperparams_override,
             max_workers=body.max_workers,
             resume=body.resume,
+            user_id=current["id"],
+            access_token=current["token"],
         ),
         media_type="text/event-stream",
         headers={
@@ -175,23 +235,36 @@ async def create_session(body: CreateSessionRequest):
 
 
 @app.get("/sessions")
-def list_sessions(user_id: Optional[str] = None):
+def list_sessions(user_id: Optional[str] = None, current=Depends(get_current_user)):
     """List all sessions, optionally filtered by user_id."""
-    return _backend.list_sessions(user_id=user_id)
+    if user_id and user_id != current["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return _backend.list_sessions(user_id=current["id"])
 
 
 @app.get("/sessions/{session_id}/status")
-def session_status(session_id: str):
+def session_status(session_id: str, current=Depends(get_current_user)):
     """Get status and engine details for a session."""
     result = _backend.get_session_status(session_id)
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
+    if result.get("session", {}).get("user_id") not in (None, current["id"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
     return result
 
 
 @app.post("/sessions/{session_id}/stop")
-def stop_session(session_id: str, body: StopSessionRequest = StopSessionRequest()):
+def stop_session(
+    session_id: str,
+    body: StopSessionRequest = StopSessionRequest(),
+    current=Depends(get_current_user),
+):
     """Stop or pause training for a session."""
+    sess = _backend.sessions.get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Not found")
+    if sess.get("user_id") not in (None, current["id"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
     result = _backend.stop_training(session_id, force=body.force)
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
@@ -199,12 +272,15 @@ def stop_session(session_id: str, body: StopSessionRequest = StopSessionRequest(
 
 
 @app.post("/inference/convert")
-def inference_convert(body: ConvertRequest):
+def inference_convert(body: ConvertRequest, current=Depends(get_current_user)):
     """Convert audio using a trained model."""
+    model_path = _ensure_safe_path(body.model_path)
+    input_audio_path = _ensure_safe_path(body.input_audio_path)
+    output_path = _ensure_safe_path(body.output_path, allow_missing=True)
     result = _backend.convert_audio(
-        model_path=body.model_path,
-        input_audio_path=body.input_audio_path,
-        output_path=body.output_path,
+        model_path=model_path,
+        input_audio_path=input_audio_path,
+        output_path=output_path,
         pitch_shift=body.pitch_shift,
     )
     if not result.get("ok"):

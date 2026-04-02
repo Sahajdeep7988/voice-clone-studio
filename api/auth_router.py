@@ -34,15 +34,16 @@ def register(body: AuthRequest):
     Returns user_id once the account is created.
     """
     sb = _supabase()
-    ok = sb.register(body.email, body.password)
-    if not ok:
+    result = sb.register(body.email, body.password)
+    if not result.get("ok"):
         raise HTTPException(
             status_code=400,
             detail="Registration failed — the email may already be in use or the password is too weak.",
         )
     return {
         "ok":      True,
-        "user_id": sb.user_id,
+        "user_id": result.get("user_id"),
+        "token":   result.get("access_token"),
         "message": "Registration successful.",
     }
 
@@ -54,16 +55,16 @@ def login(body: AuthRequest):
     Pass the token in subsequent requests as: Authorization: Bearer <token>
     """
     sb = _supabase()
-    ok = sb.login(body.email, body.password)
-    if not ok:
+    result = sb.login(body.email, body.password)
+    if not result.get("ok"):
         raise HTTPException(
             status_code=401,
             detail="Invalid credentials.",
         )
     return {
         "ok":      True,
-        "user_id": sb.user_id,
-        "token":   sb.access_token,
+        "user_id": result.get("user_id"),
+        "token":   result.get("access_token"),
         "message": "Login successful.",
     }
 
