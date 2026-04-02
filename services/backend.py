@@ -1,8 +1,7 @@
 """
 Application Backend
-Single entry-point that wires all modules together.
-Designed for future UI / API layer consumption.
-Every operation returns a structured result dict — no raw exceptions to callers.
+Single entry-point wiring all modules together.
+Every public method returns a structured result dict — no raw exceptions.
 """
 
 import os
@@ -10,27 +9,31 @@ import time
 import threading
 from datetime import datetime, timezone
 
-from core.preprocessing   import AudioPreprocessor, PreprocessingError
-from core.llm_config      import LLMConfigurator
-from core.training_engine import TrainingEngine
+from core.preprocessing    import AudioPreprocessor, PreprocessingError
+from core.llm_config       import LLMConfigurator
+from core.training_engine  import TrainingEngine
 from core.inference_engine import InferenceEngine
-from services.session_manager import SessionManager
-from services.supabase_client import SupabaseClient
+from core.logger           import get_logger
+from services.session_manager  import SessionManager
+from services.supabase_client  import SupabaseClient
+
+# Minimum segments required before training is allowed
+MIN_TRAINING_SEGMENTS = 10
 
 
 class AppBackend:
     """
     Stateful application backend.
-    One instance per application process; sessions survive across calls.
+    One instance per process; sessions survive across calls.
     """
 
     def __init__(self, base_dir: str = "."):
-        self.base_dir     = os.path.abspath(base_dir)
-        self.sessions     = SessionManager()
-        self.supabase     = SupabaseClient()
-        self._engines:  dict[str, TrainingEngine]   = {}   # model_name → engine
-        self._threads:  dict[str, threading.Thread] = {}   # session_id → thread
-        self._lock      = threading.Lock()
+        self.base_dir  = os.path.abspath(base_dir)
+        self.sessions  = SessionManager()
+        self.supabase  = SupabaseClient()
+        self._engines: dict[str, TrainingEngine]   = {}
+        self._threads: dict[str, threading.Thread] = {}
+        self._lock     = threading.Lock()
 
     # ------------------------------------------------------------------
     # Auth
@@ -49,22 +52,23 @@ class AppBackend:
         return {"ok": True}
 
     # ------------------------------------------------------------------
-    # Pipeline — blocking (for CLI) or async (for UI)
+    # Pipeline
     # ------------------------------------------------------------------
 
     def run_pipeline(
         self,
-        files:      list,
-        model_name: str,
+        files:                list,
+        model_name:           str,
         hyperparams_override: dict | None = None,
-        async_mode: bool = False,
+        async_mode:           bool = False,
+        max_workers:          int  = 4,
     ) -> dict:
         """
-        Start the full preprocessing → config → training pipeline.
+        Start preprocessing -> config -> training.
 
-        async_mode=True: returns immediately with session_id; training runs
-                         in a background thread — poll get_session_status().
+        async_mode=True: returns immediately; poll get_session_status().
         async_mode=False: blocks until training completes.
+        max_workers: parallel preprocessing workers.
         """
         session_id = self.sessions.create_session(
             model_name=model_name,
@@ -75,23 +79,20 @@ class AppBackend:
         if async_mode:
             t = threading.Thread(
                 target=self._pipeline_worker,
-                args=(session_id, files, model_name, hyperparams_override),
+                args=(session_id, files, model_name, hyperparams_override, False, max_workers),
                 daemon=True,
             )
             with self._lock:
                 self._threads[session_id] = t
             t.start()
             return {"ok": True, "session_id": session_id, "async": True}
-        else:
-            return self._pipeline_worker(session_id, files, model_name,
-                                         hyperparams_override)
 
-    def resume_pipeline(
-        self,
-        session_id:  str,
-        async_mode:  bool = False,
-    ) -> dict:
-        """Resume a paused/stopped training session."""
+        return self._pipeline_worker(
+            session_id, files, model_name, hyperparams_override,
+            resume=False, max_workers=max_workers,
+        )
+
+    def resume_pipeline(self, session_id: str, async_mode: bool = False) -> dict:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": f"Session {session_id} not found"}
@@ -111,15 +112,13 @@ class AppBackend:
             t.start()
             return {"ok": True, "session_id": session_id, "async": True}
 
-        return self._pipeline_worker(session_id, files, model_name,
-                                     hyperparams, resume=True)
+        return self._pipeline_worker(session_id, files, model_name, hyperparams, resume=True)
 
     # ------------------------------------------------------------------
     # Training control
     # ------------------------------------------------------------------
 
     def stop_training(self, session_id: str, force: bool = False) -> dict:
-        """Stop training for a session. Checkpoint is preserved."""
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
@@ -134,7 +133,7 @@ class AppBackend:
             engine.stop_training()
         self.sessions.set_status(session_id, "paused")
         checkpoint = engine.get_checkpoint_list(model_name)
-        latest = checkpoint[-1] if checkpoint else None
+        latest     = checkpoint[-1] if checkpoint else None
         if latest:
             self.sessions.set_checkpoint(session_id, latest)
         return {"ok": True, "checkpoint": latest}
@@ -157,7 +156,6 @@ class AppBackend:
     # ------------------------------------------------------------------
 
     def get_segments(self, session_id: str) -> dict:
-        """Return all segments from the manifest for user review."""
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
@@ -165,16 +163,12 @@ class AppBackend:
         return {"ok": True, "segments": preprocessor.get_segments()}
 
     def approve_segments(self, session_id: str, approved_paths: list) -> dict:
-        """Mark specific segments as approved for training."""
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
         preprocessor = AudioPreprocessor(base_dir=self.base_dir)
         count = preprocessor.approve_segments(approved_paths)
-        self.sessions.update_session(
-            session_id,
-            segment_manifest=preprocessor.manifest,
-        )
+        self.sessions.update_session(session_id, segment_manifest=preprocessor.manifest)
         return {"ok": True, "approved_count": count}
 
     def delete_segment(self, session_id: str, path: str) -> dict:
@@ -186,23 +180,23 @@ class AppBackend:
         return {"ok": ok}
 
     # ------------------------------------------------------------------
-    # Checkpoint operations
+    # Checkpoints
     # ------------------------------------------------------------------
 
     def list_checkpoints(self, session_id: str) -> dict:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
-        engine = TrainingEngine()
+        engine      = TrainingEngine()
         checkpoints = engine.get_checkpoint_list(session["model_name"])
         return {"ok": True, "checkpoints": checkpoints}
 
     def test_checkpoint(
         self,
-        session_id:       str,
-        checkpoint_path:  str,
-        test_audio_path:  str,
-        pitch_shift:      int = 0,
+        session_id:      str,
+        checkpoint_path: str,
+        test_audio_path: str,
+        pitch_shift:     int = 0,
     ) -> dict:
         session = self.sessions.get_session(session_id)
         if not session:
@@ -225,15 +219,14 @@ class AppBackend:
 
     def convert_audio(
         self,
-        model_path:        str,
-        input_audio_path:  str,
-        output_path:       str,
-        pitch_shift:       int = 0,
+        model_path:       str,
+        input_audio_path: str,
+        output_path:      str,
+        pitch_shift:      int = 0,
     ) -> dict:
         try:
             engine = InferenceEngine()
-            out    = engine.convert(model_path, input_audio_path,
-                                    output_path, pitch_shift)
+            out    = engine.convert(model_path, input_audio_path, output_path, pitch_shift)
             return {"ok": True, "output_path": out}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -243,7 +236,56 @@ class AppBackend:
         return {"ok": True, "models": engine.list_models()}
 
     # ------------------------------------------------------------------
-    # Pipeline worker (runs in thread or inline)
+    # Validation
+    # ------------------------------------------------------------------
+
+    def _validate_dataset(self, dataset_path: str) -> dict:
+        """Verify dataset is ready for training."""
+        log = get_logger(stage="validate")
+
+        if not os.path.isdir(dataset_path):
+            return {"ok": False, "error": f"Dataset path not found: {dataset_path}"}
+
+        all_wavs = [
+            f for f in os.listdir(dataset_path)
+            if f.lower().endswith(".wav")
+        ]
+
+        # Remove empty files and count valid ones
+        valid  = []
+        empty  = []
+        for f in all_wavs:
+            full = os.path.join(dataset_path, f)
+            if os.path.getsize(full) > 0:
+                valid.append(f)
+            else:
+                empty.append(full)
+
+        if empty:
+            log.warning(f"Removing {len(empty)} empty segment files")
+            for path in empty:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        if not valid:
+            return {"ok": False, "error": "No audio segments found in dataset"}
+
+        if len(valid) < MIN_TRAINING_SEGMENTS:
+            return {
+                "ok": False,
+                "error": (
+                    f"Too few segments: {len(valid)} "
+                    f"(minimum {MIN_TRAINING_SEGMENTS} required)"
+                ),
+            }
+
+        log.success(f"Dataset valid: {len(valid)} segments at {dataset_path}")
+        return {"ok": True, "segment_count": len(valid)}
+
+    # ------------------------------------------------------------------
+    # Pipeline worker
     # ------------------------------------------------------------------
 
     def _pipeline_worker(
@@ -252,36 +294,48 @@ class AppBackend:
         files:                list,
         model_name:           str,
         hyperparams_override: dict | None = None,
-        resume:               bool = False,
+        resume:               bool        = False,
+        max_workers:          int         = 4,
     ) -> dict:
+        log   = get_logger(stage="pipeline")
         start = time.time()
+
         try:
             # ── Preprocess ────────────────────────────────────────────
             self.sessions.set_status(session_id, "preprocessing")
             preprocessor = AudioPreprocessor(base_dir=self.base_dir)
 
-            if resume:
-                # Use already-approved segments from manifest
-                approved = preprocessor.get_approved_segment_paths()
-                if not approved:
-                    # Re-run preprocessing from scratch
-                    stats = preprocessor.process(files)
-                    preprocessor.approve_all()
+            with log.timed("preprocess"):
+                if resume:
+                    approved = preprocessor.get_approved_segment_paths()
+                    if not approved:
+                        stats = preprocessor.process(files, max_workers=max_workers)
+                        preprocessor.approve_all()
+                    else:
+                        import wave as _wave
+
+                        def _dur(p):
+                            try:
+                                with _wave.open(p, "rb") as wf:
+                                    return wf.getnframes() / wf.getframerate()
+                            except Exception:
+                                return 0.0
+
+                        total_s = sum(_dur(p) for p in approved if os.path.exists(p))
+                        stats = {
+                            "segment_paths":          approved,
+                            "total_duration_minutes": round(total_s / 60, 2),
+                            "segment_count":          len(approved),
+                            "quality_label":          _quality(total_s / 60),
+                            "manifest_path":          preprocessor.manifest,
+                            "total_files":            len(files),
+                            "success_count":          len(files),
+                            "failed_count":           0,
+                            "failures":               [],
+                        }
                 else:
-                    import wave
-                    total_s = sum(
-                        _wav_duration(p) for p in approved if os.path.exists(p)
-                    )
-                    stats = {
-                        "segment_paths":          approved,
-                        "total_duration_minutes": round(total_s / 60, 2),
-                        "segment_count":          len(approved),
-                        "quality_label":          _quality(total_s / 60),
-                        "manifest_path":          preprocessor.manifest,
-                    }
-            else:
-                stats = preprocessor.process(files)
-                preprocessor.approve_all()
+                    stats = preprocessor.process(files, max_workers=max_workers)
+                    preprocessor.approve_all()
 
             self.sessions.update_session(
                 session_id,
@@ -289,17 +343,36 @@ class AppBackend:
                 status="preprocessing_done",
             )
 
-            # ── Hyperparameters ────────────────────────────────────────
+            # Log failure summary if any files failed
+            if stats.get("failed_count", 0) > 0:
+                log.warning(
+                    f"Preprocessing partial: "
+                    f"{stats['success_count']}/{stats['total_files']} files OK, "
+                    f"failures: {stats['failures']}"
+                )
+
+            # ── Validate dataset ──────────────────────────────────────
+            dataset_path = os.path.join(self.base_dir, "dataset", "segments")
+            validation   = self._validate_dataset(dataset_path)
+            if not validation["ok"]:
+                self.sessions.set_status(session_id, "error", validation["error"])
+                return {"ok": False, "error": validation["error"], "session_id": session_id}
+
+            # ── Hyperparameters ───────────────────────────────────────
             if hyperparams_override:
                 hyperparams = hyperparams_override
             else:
-                configurator = LLMConfigurator()
-                hyperparams  = configurator.get_hyperparameters(stats)
+                with log.timed("llm_config"):
+                    configurator = LLMConfigurator()
+                    hyperparams  = configurator.get_hyperparameters(stats)
 
-            self.sessions.update_session(session_id, hyperparams=hyperparams,
-                                         total_epochs=hyperparams.get("epochs", 0))
+            self.sessions.update_session(
+                session_id,
+                hyperparams=hyperparams,
+                total_epochs=hyperparams.get("epochs", 0),
+            )
 
-            # ── Training ──────────────────────────────────────────────
+            # ── Train ─────────────────────────────────────────────────
             self.sessions.set_status(session_id, "training")
             engine = TrainingEngine()
             with self._lock:
@@ -307,21 +380,23 @@ class AppBackend:
 
             def on_progress(epoch: int, loss: float):
                 self.sessions.update_progress(session_id, epoch, loss)
+                get_logger(model_name, "train").info(f"epoch={epoch} loss={loss:.4f}")
 
-            model_path = engine.start_training(
-                dataset_path=os.path.join(self.base_dir, "dataset", "segments"),
-                model_name=model_name,
-                hyperparams=hyperparams,
-                progress_callback=on_progress,
-                resume=resume,
-            )
+            with log.timed("training"):
+                model_path = engine.start_training(
+                    dataset_path=os.path.join(self.base_dir, "dataset", "segments"),
+                    model_name=model_name,
+                    hyperparams=hyperparams,
+                    progress_callback=on_progress,
+                    resume=resume,
+                )
 
             self.sessions.set_status(session_id, "done")
             self.sessions.set_checkpoint(session_id, model_path)
 
             elapsed = int(time.time() - start)
 
-            # ── Optional Supabase sync ─────────────────────────────────
+            # ── Supabase sync ─────────────────────────────────────────
             if self.supabase.is_authenticated:
                 self.supabase.sync_training_session({
                     "user_id":          self.supabase.user_id,
@@ -335,14 +410,27 @@ class AppBackend:
                     "created_at":       datetime.now(timezone.utc).isoformat(),
                 })
 
-            return {"ok": True, "model_path": model_path,
-                    "session_id": session_id, "elapsed_s": elapsed}
+            log.success(f"Pipeline done: model_path={model_path} elapsed={elapsed}s")
+            return {
+                "ok":         True,
+                "model_path": model_path,
+                "session_id": session_id,
+                "elapsed_s":  elapsed,
+                "preprocess": {
+                    "total_files":   stats.get("total_files", len(files)),
+                    "success_count": stats.get("success_count", len(files)),
+                    "failed_count":  stats.get("failed_count", 0),
+                    "failures":      stats.get("failures", []),
+                },
+            }
 
         except PreprocessingError as e:
             self.sessions.set_status(session_id, "error", str(e))
+            get_logger(stage="pipeline").error(str(e))
             return {"ok": False, "error": str(e), "session_id": session_id}
         except Exception as e:
             self.sessions.set_status(session_id, "error", str(e))
+            get_logger(stage="pipeline").error(str(e))
             return {"ok": False, "error": str(e), "session_id": session_id}
         finally:
             with self._lock:
@@ -352,15 +440,6 @@ class AppBackend:
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
-
-def _wav_duration(path: str) -> float:
-    import wave
-    try:
-        with wave.open(path, "rb") as wf:
-            return wf.getnframes() / wf.getframerate()
-    except Exception:
-        return 0.0
-
 
 def _quality(minutes: float) -> str:
     if minutes < 10:

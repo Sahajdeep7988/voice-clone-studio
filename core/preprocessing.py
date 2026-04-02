@@ -1,8 +1,10 @@
 """
 Audio Preprocessing Pipeline
 Handles: MP3, WAV, FLAC, MP4, MKV, M4A, AAC, OGG, OPUS, AVI, MOV, WEBM
-Steps: FFmpeg conversion → Demucs vocal isolation → WebRTC VAD segmentation
-Extras: segment manifest, inspection API (list/delete/approve)
+Steps: FFmpeg conversion -> Demucs vocal isolation -> WebRTC VAD segmentation
+
+Parallel execution: files processed concurrently via ThreadPoolExecutor.
+Failure isolation: one bad file is marked failed; others continue.
 """
 
 import hashlib
@@ -10,8 +12,13 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from core.logger import get_logger
 
 
 class PreprocessingError(Exception):
@@ -19,16 +26,15 @@ class PreprocessingError(Exception):
 
 
 class AudioPreprocessor:
-    RAW_DIR      = "dataset/raw"
-    VOCALS_DIR   = "dataset/vocals"
-    SEGMENTS_DIR = "dataset/segments"
+    RAW_DIR       = "dataset/raw"
+    VOCALS_DIR    = "dataset/vocals"
+    SEGMENTS_DIR  = "dataset/segments"
     MANIFEST_PATH = "dataset/segments/manifest.json"
 
-    # All formats FFmpeg can decode
     SUPPORTED_FORMATS = {
-        ".mp3", ".wav", ".flac",                    # audio
-        ".m4a", ".aac", ".ogg", ".opus", ".wma",    # audio
-        ".mp4", ".mkv", ".avi", ".mov", ".webm",    # video
+        ".mp3", ".wav", ".flac",
+        ".m4a", ".aac", ".ogg", ".opus", ".wma",
+        ".mp4", ".mkv", ".avi", ".mov", ".webm",
     }
 
     MIN_SEGMENT_SECONDS = 1.5
@@ -42,75 +48,146 @@ class AudioPreprocessor:
         self.manifest   = os.path.join(self.base_dir, self.MANIFEST_PATH)
         for d in [self.raw_dir, self.vocals_dir, self.segs_dir]:
             os.makedirs(d, exist_ok=True)
-        # Lazy Demucs model cache — loaded once per instance
-        self._demucs_model = None
+
+        self._demucs_model  = None
+        self._demucs_lock   = threading.Lock()   # serialise GPU calls
+        self._manifest_lock = threading.Lock()   # serialise manifest writes
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def process(self, file_paths: list) -> dict:
+    def process(self, file_paths: list, max_workers: int = 4) -> dict:
         """
-        Process a list of audio/video files through the full pipeline.
-        Files are processed sequentially; results are aggregated.
-        Returns a quality report dict including segment manifest.
-        """
-        self._validate_formats(file_paths)
+        Process files in parallel (up to max_workers concurrently).
+        One bad file does not abort others.
 
-        segment_paths = []
+        Returns:
+            {segment_paths, total_duration_minutes, segment_count, quality_label,
+             manifest_path, total_files, success_count, failed_count, failures}
+        """
+        # Only assert existence here; format/content errors are isolated per-file
         for fp in file_paths:
-            raw_path   = self._ffmpeg_convert(fp)
-            vocal_path = self._demucs_isolate(raw_path)
-            segs       = self._vad_segment(vocal_path, source_file=fp)
-            segment_paths.extend(segs)
+            if not os.path.exists(fp):
+                raise PreprocessingError(f"File not found: {fp}")
 
-        total_seconds  = sum(self._wav_duration(s) for s in segment_paths)
-        total_minutes  = total_seconds / 60.0
+        workers   = min(max_workers, len(file_paths))
+        successes = []
+        failures  = []
+
+        log = get_logger(stage="preprocess")
+        log.info(f"Starting parallel preprocessing: files={len(file_paths)} workers={workers}")
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._process_one, fp): fp for fp in file_paths}
+            for future in as_completed(futures):
+                result = future.result()
+                if result["ok"]:
+                    successes.append(result)
+                else:
+                    failures.append({"file": result["file"], "reason": result["reason"]})
+
+        all_segments = []
+        for r in successes:
+            all_segments.extend(r["segments"])
+
+        if not all_segments:
+            reasons = "; ".join(f["reason"] for f in failures[:3])
+            raise PreprocessingError(
+                f"All {len(file_paths)} file(s) failed preprocessing. Reasons: {reasons}"
+            )
+
+        total_seconds = sum(self._wav_duration(s) for s in all_segments)
+        total_minutes = total_seconds / 60.0
 
         if total_minutes < self.MIN_TOTAL_MINUTES:
             raise PreprocessingError(
-                f"Dataset too short: minimum 5 minutes required "
-                f"(got {total_minutes:.2f} minutes)"
+                f"Dataset too short: {total_minutes:.2f} min "
+                f"(minimum {self.MIN_TOTAL_MINUTES} min). "
+                f"Failed files: {len(failures)}"
             )
 
-        if total_minutes < 10:
-            quality = "Poor"
-        elif total_minutes <= 20:
-            quality = "Acceptable"
-        else:
-            quality = "Optimal"
+        quality = (
+            "Poor"       if total_minutes < 10   else
+            "Acceptable" if total_minutes <= 20  else
+            "Optimal"
+        )
 
-        self._write_manifest(segment_paths)
+        with self._manifest_lock:
+            self._write_manifest(all_segments)
 
-        return {
-            "segment_paths":          segment_paths,
+        summary = {
+            "segment_paths":          all_segments,
             "total_duration_minutes": round(total_minutes, 2),
-            "segment_count":          len(segment_paths),
+            "segment_count":          len(all_segments),
             "quality_label":          quality,
             "manifest_path":          self.manifest,
+            "total_files":            len(file_paths),
+            "success_count":          len(successes),
+            "failed_count":           len(failures),
+            "failures":               failures,
         }
 
+        log.success(
+            f"total_files={len(file_paths)} success={len(successes)} "
+            f"failed={len(failures)} segments={len(all_segments)} "
+            f"duration={round(total_minutes, 2)}min quality={quality}"
+        )
+        return summary
+
     # ------------------------------------------------------------------
-    # Segment inspection API (for user review before training)
+    # Per-file worker (runs inside thread pool)
+    # ------------------------------------------------------------------
+
+    def _process_one(self, fp: str) -> dict:
+        """
+        Full pipeline for a single file. Never raises — returns result dict.
+        """
+        t0 = time.perf_counter()
+
+        try:
+            # Format check — fail fast per-file, not globally
+            ext = Path(fp).suffix.lower()
+            if ext not in self.SUPPORTED_FORMATS:
+                raise PreprocessingError(
+                    f"Unsupported format '{ext}'. "
+                    f"Supported: {', '.join(sorted(self.SUPPORTED_FORMATS))}"
+                )
+
+            # FFmpeg: I/O-bound, fully parallel
+            with get_logger(fp, "ffmpeg").timed("convert"):
+                raw_path = self._ffmpeg_convert(fp)
+
+            # Demucs: GPU-bound, serialized via lock to avoid OOM
+            with self._demucs_lock:
+                with get_logger(fp, "demucs").timed("isolate"):
+                    vocal_path = self._demucs_isolate(raw_path)
+
+            # VAD: CPU-bound, fully parallel
+            with get_logger(fp, "vad").timed("segment"):
+                segs = self._vad_segment(vocal_path, source_file=fp)
+
+            elapsed = time.perf_counter() - t0
+            get_logger(fp, "preprocess").success(f"segments={len(segs)}", elapsed)
+            return {"ok": True, "file": fp, "segments": segs}
+
+        except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            get_logger(fp, "preprocess").error(str(exc), elapsed)
+            return {"ok": False, "file": fp, "segments": [], "reason": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Segment inspection API
     # ------------------------------------------------------------------
 
     def get_segments(self) -> list:
-        """
-        Return list of segment metadata dicts from the manifest.
-        Each dict: {path, duration_s, source_file, approved, size_bytes}
-        """
         if not os.path.exists(self.manifest):
             return []
         with open(self.manifest) as f:
             return json.load(f)
 
     def approve_segments(self, approved_paths: list) -> int:
-        """
-        Mark specific segment paths as approved=True, others as approved=False.
-        Returns count of approved segments.
-        Only approved segments are used for training.
-        """
-        segs = self.get_segments()
+        segs         = self.get_segments()
         approved_set = set(os.path.abspath(p) for p in approved_paths)
         for seg in segs:
             seg["approved"] = os.path.abspath(seg["path"]) in approved_set
@@ -120,7 +197,6 @@ class AudioPreprocessor:
         return count
 
     def approve_all(self) -> int:
-        """Mark all existing segments as approved."""
         segs = self.get_segments()
         for seg in segs:
             seg["approved"] = True
@@ -128,12 +204,11 @@ class AudioPreprocessor:
         return len(segs)
 
     def delete_segment(self, path: str) -> bool:
-        """Delete a segment file and remove it from the manifest."""
         abs_path = os.path.abspath(path)
-        segs = self.get_segments()
+        segs     = self.get_segments()
         new_segs = [s for s in segs if os.path.abspath(s["path"]) != abs_path]
         if len(new_segs) == len(segs):
-            return False  # not found
+            return False
         if os.path.exists(abs_path):
             os.remove(abs_path)
         self._save_manifest(new_segs)
@@ -141,7 +216,6 @@ class AudioPreprocessor:
         return True
 
     def get_approved_segment_paths(self) -> list:
-        """Return paths of all approved segments (for passing to training)."""
         return [s["path"] for s in self.get_segments() if s.get("approved", True)]
 
     # ------------------------------------------------------------------
@@ -149,32 +223,26 @@ class AudioPreprocessor:
     # ------------------------------------------------------------------
 
     def _ffmpeg_convert(self, input_path: str) -> str:
-        # Use a hash-based name to avoid collisions between files with same stem
-        stem  = Path(input_path).stem
-        fhash = hashlib.md5(os.path.abspath(input_path).encode()).hexdigest()[:8]
+        stem     = Path(input_path).stem
+        fhash    = hashlib.md5(os.path.abspath(input_path).encode()).hexdigest()[:8]
         out_path = os.path.join(self.raw_dir, f"{stem}_{fhash}.wav")
 
         if os.path.exists(out_path):
-            print(f"[Preprocess] Already converted (cached): {out_path}")
             return out_path
 
         cmd = [
             "ffmpeg", "-y", "-i", input_path,
-            "-ar", "44100",
-            "-ac", "1",
-            "-sample_fmt", "s16",
-            out_path,
+            "-ar", "44100", "-ac", "1", "-sample_fmt", "s16", out_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise PreprocessingError(
-                f"FFmpeg failed for {input_path}:\n{result.stderr}"
+                f"FFmpeg failed for {input_path}:\n{result.stderr[-500:]}"
             )
-        print(f"[Preprocess] Converted: {input_path} → {out_path}")
         return out_path
 
     # ------------------------------------------------------------------
-    # Step 2: Demucs vocal isolation (Python API)
+    # Step 2: Demucs vocal isolation
     # ------------------------------------------------------------------
 
     def _demucs_isolate(self, wav_path: str) -> str:
@@ -188,12 +256,9 @@ class AudioPreprocessor:
         vocal_path = os.path.join(self.vocals_dir, f"{stem}_vocals.wav")
 
         if os.path.exists(vocal_path):
-            print(f"[Preprocess] Vocals already isolated (cached): {vocal_path}")
             return vocal_path
 
-        # Load model once per instance
         if self._demucs_model is None:
-            print("[Preprocess] Loading htdemucs model (first call)...")
             args = argparse.Namespace(
                 name="htdemucs", repo=None,
                 device="cuda" if torch.cuda.is_available() else "cpu",
@@ -206,10 +271,9 @@ class AudioPreprocessor:
                 self._demucs_model.cuda()
 
         model = self._demucs_model
-        print(f"[Preprocess] Separating vocals: {wav_path}")
-        wav = load_track(wav_path, model.audio_channels, model.samplerate)
-        ref = wav.mean(0)
-        wav = (wav - ref.mean()) / ref.std()
+        wav   = load_track(wav_path, model.audio_channels, model.samplerate)
+        ref   = wav.mean(0)
+        wav   = (wav - ref.mean()) / ref.std()
 
         with torch.no_grad():
             sources = apply_model(
@@ -218,12 +282,11 @@ class AudioPreprocessor:
                 shifts=1, split=True, overlap=0.25, progress=True,
             )[0]
 
-        sources    = sources * ref.std() + ref.mean()
-        vocal_idx  = model.sources.index("vocals")
-        vocal_np   = sources[vocal_idx].cpu().numpy().T  # [samples, channels]
+        sources   = sources * ref.std() + ref.mean()
+        vocal_idx = model.sources.index("vocals")
+        vocal_np  = sources[vocal_idx].cpu().numpy().T
 
         sf.write(vocal_path, vocal_np, model.samplerate, subtype="PCM_16")
-        print(f"[Preprocess] Vocals isolated: {vocal_path}")
         return vocal_path
 
     # ------------------------------------------------------------------
@@ -236,9 +299,8 @@ class AudioPreprocessor:
         vad   = webrtcvad.Vad(3)
         audio, sample_rate, num_channels = self._read_wav(wav_path)
 
-        # VAD requires 8k/16k/32k/48k Hz mono
         if sample_rate not in (8000, 16000, 32000, 48000) or num_channels != 1:
-            wav_path  = self._resample_for_vad(wav_path)
+            wav_path = self._resample_for_vad(wav_path)
             audio, sample_rate, num_channels = self._read_wav(wav_path)
 
         frame_ms    = 30
@@ -259,20 +321,18 @@ class AudioPreprocessor:
             except Exception:
                 voiced_flags.append(False)
 
-        # Merge consecutive voiced frames → segments with padding
-        segments   = []
-        in_seg     = False
-        seg_start  = 0
-        PADDING_FRAMES = 5  # keep 5 frames of silence around speech
+        segments  = []
+        in_seg    = False
+        seg_start = 0
+        PADDING   = 5
 
         for i, voiced in enumerate(voiced_flags):
             if voiced and not in_seg:
                 in_seg    = True
-                seg_start = max(0, i - PADDING_FRAMES)
+                seg_start = max(0, i - PADDING)
             elif not voiced and in_seg:
                 in_seg = False
-                segments.append((seg_start, min(len(voiced_flags), i + PADDING_FRAMES)))
-
+                segments.append((seg_start, min(len(voiced_flags), i + PADDING)))
         if in_seg:
             segments.append((seg_start, len(voiced_flags)))
 
@@ -287,10 +347,6 @@ class AudioPreprocessor:
             self._write_wav(out_path, seg_audio, sample_rate)
             saved_paths.append(out_path)
 
-        print(
-            f"[Preprocess] VAD segmented {Path(wav_path).name}: "
-            f"{len(saved_paths)} segments kept"
-        )
         return saved_paths
 
     # ------------------------------------------------------------------
@@ -301,7 +357,6 @@ class AudioPreprocessor:
         existing = {s["path"]: s for s in self.get_segments()}
         entries  = []
         for path in segment_paths:
-            abs_path = os.path.abspath(path)
             entry = existing.get(path, {
                 "path":       path,
                 "duration_s": round(self._wav_duration(path), 3),
@@ -326,11 +381,11 @@ class AudioPreprocessor:
     def _resample_for_vad(self, wav_path: str) -> str:
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
-        cmd = ["ffmpeg", "-y", "-i", wav_path,
-               "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", tmp.name]
+        cmd    = ["ffmpeg", "-y", "-i", wav_path, "-ar", "16000", "-ac", "1",
+                  "-sample_fmt", "s16", tmp.name]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise PreprocessingError(f"Resample for VAD failed:\n{result.stderr}")
+            raise PreprocessingError(f"Resample for VAD failed:\n{result.stderr[-300:]}")
         return tmp.name
 
     def _write_wav(self, path: str, raw: bytes, rate: int) -> None:
@@ -341,8 +396,11 @@ class AudioPreprocessor:
             wf.writeframes(raw)
 
     def _wav_duration(self, wav_path: str) -> float:
-        with wave.open(wav_path, "rb") as wf:
-            return wf.getnframes() / wf.getframerate()
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                return wf.getnframes() / wf.getframerate()
+        except Exception:
+            return 0.0
 
     def _validate_formats(self, file_paths: list) -> None:
         for fp in file_paths:
