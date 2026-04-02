@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import inspect
 import sys
 
 
@@ -109,11 +110,22 @@ def run_pipeline():
     print(f"\n[Pipeline] Starting: model='{args.model_name}' "
           f"files={len(args.files)} resume={args.resume}")
 
-    result = backend.run_pipeline(
-        files=args.files,
-        model_name=args.model_name,
-        async_mode=False,
-    )
+    if args.resume:
+        print("[Pipeline] Resume requested; will reuse existing checkpoints if found.")
+
+    run_kwargs = {
+        "files": args.files,
+        "model_name": args.model_name,
+        "async_mode": False,
+    }
+    try:
+        if "resume" in inspect.signature(backend.run_pipeline).parameters:
+            if args.resume:
+                run_kwargs["resume"] = True
+    except (TypeError, ValueError):
+        pass
+
+    result = backend.run_pipeline(**run_kwargs)
 
     _print_json(result)
 

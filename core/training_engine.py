@@ -61,10 +61,19 @@ class TrainingEngine:
         save_every   = hyperparams.get("save_every_n_epochs", 50)
         cpu_cores    = os.cpu_count() or 4
 
+        segments_ready    = self._segments_ready(dataset_path)
+        rvc_preprocessed  = self._rvc_preprocess_done(model_name)
         already_extracted = self._extraction_done(model_name)
+        latest_ckpt       = self._find_latest_g_checkpoint(model_name)
+        has_checkpoint    = latest_ckpt is not None
 
-        if resume and already_extracted:
-            print(f"[TrainingEngine] Resuming '{model_name}' — skipping preprocess+extract.")
+        if has_checkpoint:
+            print(f"[Training] Resuming from checkpoint {os.path.basename(latest_ckpt)}")
+
+        if resume or has_checkpoint:
+            print("[Pipeline] Skipping preprocess (resume mode)")
+        elif segments_ready and rvc_preprocessed:
+            print("[Pipeline] Skipping preprocess (already exists)")
         else:
             self._run_step(
                 label="Preprocess",
@@ -84,6 +93,13 @@ class TrainingEngine:
                     "none",
                 ],
             )
+
+        if already_extracted:
+            if resume or has_checkpoint:
+                print("[Pipeline] Skipping extract (resume mode)")
+            else:
+                print("[Pipeline] Skipping extract (already exists)")
+        else:
             self._run_step(
                 label="Extract",
                 cmd=[
@@ -305,9 +321,16 @@ class TrainingEngine:
     # ------------------------------------------------------------------
 
     def _extraction_done(self, model_name: str) -> bool:
-        """True if filelist.txt exists and is non-empty (extract already ran)."""
-        filelist = os.path.join(APPLIO_LOGS, model_name, "filelist.txt")
-        return os.path.exists(filelist) and os.path.getsize(filelist) > 0
+        """True if filelist.txt exists and extracted feature files are present."""
+        model_dir = Path(APPLIO_LOGS) / model_name
+        filelist = model_dir / "filelist.txt"
+        if not filelist.exists() or filelist.stat().st_size <= 0:
+            return False
+        try:
+            next(model_dir.rglob("*.npy"))
+            return True
+        except StopIteration:
+            return False
 
     def _run_step(self, label: str, cmd: list) -> None:
         print(f"[TrainingEngine] {label}: {' '.join(cmd)}")
@@ -321,3 +344,36 @@ class TrainingEngine:
         if checkpoints:
             return checkpoints[-1]
         return os.path.join(APPLIO_LOGS, model_name, "G_2333333.pth")
+
+    def _find_latest_g_checkpoint(self, model_name: str) -> str | None:
+        model_dir = Path(APPLIO_LOGS) / model_name
+        if not model_dir.is_dir():
+            return None
+        g_files = sorted(
+            model_dir.glob("G_*.pth"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not g_files:
+            return None
+        return str(g_files[-1])
+
+    def _segments_ready(self, dataset_path: str) -> bool:
+        segments_dir = dataset_path
+        if os.path.basename(segments_dir) != "segments":
+            segments_dir = os.path.join(segments_dir, "segments")
+        if not os.path.isdir(segments_dir):
+            return False
+        try:
+            return any(entry.is_file() for entry in os.scandir(segments_dir))
+        except OSError:
+            return False
+
+    def _rvc_preprocess_done(self, model_name: str) -> bool:
+        model_dir = Path(APPLIO_LOGS) / model_name
+        sliced_dir = model_dir / "sliced_audios"
+        if not sliced_dir.is_dir():
+            return False
+        try:
+            return any(p.suffix == ".wav" for p in sliced_dir.iterdir())
+        except OSError:
+            return False

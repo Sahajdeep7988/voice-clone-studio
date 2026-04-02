@@ -6,6 +6,7 @@
 models/
 dataset/
 logs/
+test_inputs/
 
 # Python
 __pycache__/

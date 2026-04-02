@@ -62,6 +62,7 @@ class AppBackend:
         hyperparams_override: dict | None = None,
         async_mode:           bool = False,
         max_workers:          int  = 4,
+        resume:              bool | None = None,
     ) -> dict:
         """
         Start preprocessing -> config -> training.
@@ -70,16 +71,33 @@ class AppBackend:
         async_mode=False: blocks until training completes.
         max_workers: parallel preprocessing workers.
         """
-        session_id = self.sessions.create_session(
-            model_name=model_name,
-            files=files,
-            user_id=self.supabase.user_id,
-        )
+        session_id = None
+        if resume is None:
+            checkpoint_exists = len(TrainingEngine().get_checkpoint_list(model_name)) > 0
+            resume = checkpoint_exists
+
+        if resume:
+            for s in self.sessions.find_by_model(model_name):
+                candidate_id = s.get("session_id")
+                if not candidate_id:
+                    continue
+                session_dir = os.path.join(self.base_dir, "sessions_data", candidate_id)
+                if os.path.isdir(session_dir):
+                    session_id = candidate_id
+                    print(f"[Session] Reusing existing session: {session_id}")
+                    break
+
+        if session_id is None:
+            session_id = self.sessions.create_session(
+                model_name=model_name,
+                files=files,
+                user_id=self.supabase.user_id,
+            )
 
         if async_mode:
             t = threading.Thread(
                 target=self._pipeline_worker,
-                args=(session_id, files, model_name, hyperparams_override, False, max_workers),
+                args=(session_id, files, model_name, hyperparams_override, resume, max_workers),
                 daemon=True,
             )
             with self._lock:
@@ -89,7 +107,7 @@ class AppBackend:
 
         return self._pipeline_worker(
             session_id, files, model_name, hyperparams_override,
-            resume=False, max_workers=max_workers,
+            resume=resume, max_workers=max_workers,
         )
 
     def resume_pipeline(self, session_id: str, async_mode: bool = False) -> dict:
@@ -311,6 +329,9 @@ class AppBackend:
     ) -> dict:
         log   = get_logger(stage="pipeline")
         start = time.time()
+        checkpoint_exists = len(TrainingEngine().get_checkpoint_list(model_name)) > 0
+        resume = resume or checkpoint_exists
+        print(f"[Pipeline] Resume mode: {resume}")
 
         try:
             # ── Preprocess ────────────────────────────────────────────
@@ -325,6 +346,7 @@ class AppBackend:
                         stats = preprocessor.process(files, max_workers=max_workers)
                         preprocessor.approve_all()
                     else:
+                        print("[Pipeline] Skipping preprocess (resume mode)")
                         import wave as _wave
 
                         def _dur(p):
