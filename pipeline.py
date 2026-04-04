@@ -54,11 +54,16 @@ def run_pipeline():
     from services.backend import AppBackend
     backend = AppBackend()
 
-    # Optional auth
+    # Optional auth — store tokens so they reach the pipeline for Supabase sync.
+    _user_id      = None
+    _access_token = None
+
     if args.email and args.password:
         result = backend.login(args.email, args.password)
         if result["ok"]:
-            print(f"[Auth] Logged in (user_id={result['user_id']})")
+            _user_id      = result.get("user_id")
+            _access_token = result.get("access_token")
+            print(f"[Auth] Logged in (user_id={_user_id})")
         else:
             print("[Auth] Login failed — continuing without Supabase sync.")
 
@@ -98,7 +103,11 @@ def run_pipeline():
 
     if args.resume_session:
         print(f"[Pipeline] Resuming session {args.resume_session}...")
-        result = backend.resume_pipeline(args.resume_session, async_mode=False)
+        result = backend.resume_pipeline(
+            args.resume_session,
+            async_mode=False,
+            access_token=_access_token,
+        )
         _print_json(result)
         return
 
@@ -114,9 +123,11 @@ def run_pipeline():
         print("[Pipeline] Resume requested; will reuse existing checkpoints if found.")
 
     run_kwargs = {
-        "files": args.files,
-        "model_name": args.model_name,
-        "async_mode": False,
+        "files":        args.files,
+        "model_name":   args.model_name,
+        "async_mode":   False,
+        "user_id":      _user_id,
+        "access_token": _access_token,
     }
     try:
         if "resume" in inspect.signature(backend.run_pipeline).parameters:

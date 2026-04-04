@@ -24,7 +24,7 @@ def test_create_session_invalid_input_422(client):
 def test_invalid_json_400(client):
     r = client.post(
         "/sessions/create",
-        data="{bad json",
+        content="{bad json",
         headers={"Content-Type": "application/json", "Authorization": "Bearer test.token.value"},
     )
     assert r.status_code in (400, 422)

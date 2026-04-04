@@ -57,16 +57,18 @@ def _make_supabase_mock(
     user_by_token: dict | None = None,
 ) -> MagicMock:
     sb = MagicMock()
-    sb.login.return_value              = {
-        "ok": login_ok,
-        "user_id": user_id if login_ok else None,
-        "access_token": token if login_ok else None,
-    }
-    sb.register.return_value           = {
-        "ok": register_ok,
-        "user_id": user_id if register_ok else None,
-        "access_token": token if register_ok else None,
-    }
+    sb.login.return_value              = (
+        {"ok": True, "user_id": user_id, "access_token": token, "refresh_token": "refresh.tok",
+         "email": "test@example.com"}
+        if login_ok else
+        {"ok": False, "code": "invalid_credentials", "detail": "Invalid email or password."}
+    )
+    sb.register.return_value           = (
+        {"ok": True, "user_id": user_id, "access_token": token, "refresh_token": "refresh.tok",
+         "email": "test@example.com"}
+        if register_ok else
+        {"ok": False, "code": "email_exists", "detail": "User already registered."}
+    )
     sb.logout.return_value             = True
     sb.get_user_by_token.return_value  = (
         user_by_token if user_by_token is not None else (FAKE_USER if login_ok else None)
@@ -123,22 +125,23 @@ class TestRegister:
         })
         sb.register.assert_called_once_with("check@example.com", "Pass1234!")
 
-    def test_duplicate_email_400(self, auth_client):
+    def test_duplicate_email_409(self, auth_client):
         client, sb = auth_client
-        sb.register.return_value = {"ok": False}
+        sb.register.return_value = {"ok": False, "code": "email_exists"}
         r = client.post("/auth/register", json={
             "email": "taken@example.com", "password": "Pass1234!"
         })
-        assert r.status_code == 400
-        assert "email" in r.json()["detail"].lower() or "registration" in r.json()["detail"].lower()
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert "email" in detail["message"].lower()
 
-    def test_supabase_offline_400(self, auth_client):
+    def test_supabase_offline_503(self, auth_client):
         client, sb = auth_client
-        sb.register.return_value = {"ok": False}
+        sb.register.return_value = {"ok": False, "code": "network_error"}
         r = client.post("/auth/register", json={
-            "email": "x@x.com", "password": "abc123"
+            "email": "x@x.com", "password": "Pass1234!"
         })
-        assert r.status_code == 400
+        assert r.status_code == 503
 
     def test_missing_email_422(self, auth_client):
         client, _ = auth_client
@@ -200,28 +203,28 @@ class TestLogin:
 
     def test_wrong_password_401(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = {"ok": False}
+        sb.login.return_value = {"ok": False, "code": "invalid_credentials"}
         r = client.post("/auth/login", json={
             "email": "test@example.com", "password": "wrong"
         })
         assert r.status_code == 401
-        assert "credentials" in r.json()["detail"].lower()
+        assert "invalid" in r.json()["detail"]["message"].lower()
 
     def test_unknown_email_401(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = {"ok": False}
+        sb.login.return_value = {"ok": False, "code": "invalid_credentials"}
         r = client.post("/auth/login", json={
             "email": "nobody@example.com", "password": "anything"
         })
         assert r.status_code == 401
 
-    def test_supabase_offline_401(self, auth_client):
+    def test_supabase_offline_503(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = {"ok": False}
+        sb.login.return_value = {"ok": False, "code": "network_error"}
         r = client.post("/auth/login", json={
             "email": "a@b.com", "password": "pw"
         })
-        assert r.status_code == 401
+        assert r.status_code == 503
 
     def test_token_in_response(self, auth_client):
         client, sb = auth_client
@@ -252,7 +255,7 @@ class TestLogin:
 
     def test_no_token_on_failure(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = {"ok": False}
+        sb.login.return_value = {"ok": False, "code": "invalid_credentials"}
         r = client.post("/auth/login", json={"email": "a@b.com", "password": "bad"})
         assert r.status_code == 401
         assert "token" not in r.json()
@@ -337,7 +340,9 @@ class TestMe:
         sb.get_user_by_token.return_value = None
         r = client.get("/auth/me", headers=self._auth_header("invalid.token"))
         assert r.status_code == 401
-        assert "invalid" in r.json()["detail"].lower() or "expired" in r.json()["detail"].lower()
+        detail = r.json()["detail"]
+        msg = detail["message"] if isinstance(detail, dict) else detail
+        assert "invalid" in msg.lower() or "expired" in msg.lower()
 
     def test_expired_token_401(self, auth_client):
         client, sb = auth_client
@@ -349,7 +354,9 @@ class TestMe:
         client, _ = auth_client
         r = client.get("/auth/me")
         assert r.status_code == 401
-        assert "authorization" in r.json()["detail"].lower()
+        detail = r.json()["detail"]
+        msg = detail["message"] if isinstance(detail, dict) else detail
+        assert "authorization" in msg.lower() or "missing" in msg.lower()
 
     def test_malformed_no_bearer_prefix_401(self, auth_client):
         client, _ = auth_client
@@ -369,17 +376,30 @@ class TestMe:
     def test_supabase_network_error_returns_401(self, auth_client):
         """If get_user_by_token returns None (network/offline), respond 401."""
         client, sb = auth_client
+        # Use a unique token that can't be in the cache from prior tests.
         sb.get_user_by_token.return_value = None
-        r = client.get("/auth/me", headers=self._auth_header())
+        r = client.get("/auth/me", headers={"Authorization": "Bearer unique.network.error.token"})
         assert r.status_code == 401
 
     def test_logged_out_state_401(self, auth_client):
-        """After logout, a previously valid token should return 401 (server-side revocation)."""
+        """After logout, a previously valid token should return 401 (server-side revocation).
+        The logout route evicts the token from cache, so the next /me call hits Supabase,
+        which returns None (revoked token).
+        """
         client, sb = auth_client
-        # After logout, Supabase invalidates the token server-side
+        # Use a unique token to avoid cross-test cache pollution.
+        unique_token = "unique.logout.test.token.xyz"
+        sb.get_user_by_token.return_value = FAKE_USER
+
+        # Prime the cache via /me (cache miss → Supabase → cache set)
+        client.get("/auth/me", headers={"Authorization": f"Bearer {unique_token}"})
+
+        # Logout — evicts the token from cache
+        client.post("/auth/logout", headers={"Authorization": f"Bearer {unique_token}"})
+
+        # After logout, Supabase returns None (token revoked server-side)
         sb.get_user_by_token.return_value = None
-        client.post("/auth/logout")
-        r = client.get("/auth/me", headers=self._auth_header())
+        r = client.get("/auth/me", headers={"Authorization": f"Bearer {unique_token}"})
         assert r.status_code == 401
 
 
@@ -429,8 +449,8 @@ class TestAuthScenarios:
                 })
                 token = r1.json()["token"]
 
-                # Logout
-                client.post("/auth/logout")
+                # Logout with Authorization header so the cache gets evicted
+                client.post("/auth/logout", headers={"Authorization": f"Bearer {token}"})
 
                 # After logout Supabase token is revoked → get_user_by_token returns None
                 sb.get_user_by_token.return_value = None

@@ -102,7 +102,7 @@ class TestLogin:
 
     def test_login_failure(self, auth_client):
         client, sb = auth_client
-        sb.login.return_value = {"ok": False}
+        sb.login.return_value = {"ok": False, "code": "invalid_credentials"}
         r = client.post("/auth/login", json={
             "email": "test@example.com", "password": "wrong"
         })

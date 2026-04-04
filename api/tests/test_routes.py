@@ -131,13 +131,19 @@ class TestStopSession:
         r = client.post("/sessions/sess-abc-123/stop", json={})
         assert r.status_code == 200
         assert r.json()["ok"] is True
-        mock_backend.stop_training.assert_called_once_with("sess-abc-123", force=False)
+        args, kwargs = mock_backend.stop_training.call_args
+        assert args[0] == "sess-abc-123"
+        assert kwargs["force"] is False
+        assert "user_id" in kwargs
+        assert "access_token" in kwargs
 
     def test_force_stop(self, client, mock_backend):
         mock_backend.stop_training.return_value = {"ok": True, "checkpoint": None}
         r = client.post("/sessions/sess-abc-123/stop", json={"force": True})
         assert r.status_code == 200
-        mock_backend.stop_training.assert_called_once_with("sess-abc-123", force=True)
+        args, kwargs = mock_backend.stop_training.call_args
+        assert args[0] == "sess-abc-123"
+        assert kwargs["force"] is True
 
     def test_stop_not_found(self, client, mock_backend):
         mock_backend.stop_training.return_value = {
@@ -149,7 +155,9 @@ class TestStopSession:
     def test_empty_body_defaults_to_graceful(self, client, mock_backend):
         mock_backend.stop_training.return_value = {"ok": True, "checkpoint": None}
         client.post("/sessions/sess-abc-123/stop")
-        mock_backend.stop_training.assert_called_once_with("sess-abc-123", force=False)
+        args, kwargs = mock_backend.stop_training.call_args
+        assert args[0] == "sess-abc-123"
+        assert kwargs["force"] is False
 
     def test_no_active_engine(self, client, mock_backend):
         mock_backend.stop_training.return_value = {

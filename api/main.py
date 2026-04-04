@@ -4,9 +4,12 @@ Wraps AppBackend; does not modify any existing files.
 """
 
 import asyncio
+import hashlib
 import json
 import sys
 import os
+import threading
+import time
 from typing import Optional
 
 # Ensure project root is on the path regardless of working directory.
@@ -27,12 +30,88 @@ _backend = AppBackend(base_dir=_ROOT)
 
 
 # ---------------------------------------------------------------------------
+# Token validation cache
+# ---------------------------------------------------------------------------
+
+class _TokenCache:
+    """
+    In-process cache for validated Supabase JWTs.
+
+    Every authenticated route calls get_user_by_token(), which is a live
+    Supabase network round-trip.  Under any polling load (e.g. the Active
+    Training view hitting /status every few seconds) this becomes the
+    dominant latency source.
+
+    Cache behaviour:
+      - Key: SHA-256 of the raw token — raw JWTs are never stored.
+      - TTL: 30 seconds.  Short enough that revoked tokens (logout,
+        password-change) are evicted quickly; long enough to collapse
+        rapid-fire identical requests into one Supabase call.
+      - Thread-safe: FastAPI runs sync route handlers in a thread pool.
+      - Eviction: lazy (on read) + size-triggered (on write, if > 500
+        entries, expired entries are swept before inserting).  No
+        background thread required.
+    """
+
+    TTL      = 30    # seconds a validated token is trusted without re-checking
+    MAX_SIZE = 500   # sweep expired entries when cache exceeds this count
+
+    def __init__(self):
+        # {sha256_hex: (user_dict, expires_monotonic)}
+        self._store: dict[str, tuple[dict, float]] = {}
+        self._lock  = threading.Lock()
+
+    # public API ──────────────────────────────────────────────────────────────
+
+    def get(self, token: str) -> dict | None:
+        key = self._hash(token)
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            user, exp = entry
+            if time.monotonic() > exp:
+                del self._store[key]
+                return None
+            return user
+
+    def set(self, token: str, user: dict) -> None:
+        key = self._hash(token)
+        with self._lock:
+            if len(self._store) >= self.MAX_SIZE:
+                self._sweep()
+            self._store[key] = (user, time.monotonic() + self.TTL)
+
+    def invalidate(self, token: str) -> None:
+        """Evict one token immediately — call after logout or password change."""
+        with self._lock:
+            self._store.pop(self._hash(token), None)
+
+    # internals ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hash(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def _sweep(self) -> None:
+        """Remove all expired entries. Must be called under self._lock."""
+        now = time.monotonic()
+        expired = [k for k, (_, exp) in self._store.items() if now > exp]
+        for k in expired:
+            del self._store[k]
+
+
+_token_cache = _TokenCache()
+
+
+# ---------------------------------------------------------------------------
 # Auth + Path Safety
 # ---------------------------------------------------------------------------
 
 _SAFE_DIRS = [
     os.path.abspath(os.path.join(_ROOT, "sessions_data")),
     os.path.abspath(os.path.join(_ROOT, "test_inputs")),
+    os.path.abspath(os.path.join(_ROOT, "uploads")),
     os.path.expanduser("~/voice-clone-studio"),
     os.path.expanduser("~/Desktop/voice-clone-studio"),
     os.path.expanduser("~/VoiceClone"),
@@ -68,10 +147,15 @@ def _get_token(authorization: Optional[str] = Header(None)) -> str:
 
 
 def get_current_user(token: str = Depends(_get_token)) -> dict:
+    cached = _token_cache.get(token)
+    if cached:
+        return cached
     user = _backend.supabase.get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
-    return {"id": user["id"], "token": token}
+    result = {"id": user["id"], "token": token}
+    _token_cache.set(token, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -265,10 +349,58 @@ def stop_session(
         raise HTTPException(status_code=404, detail="Not found")
     if sess.get("user_id") not in (None, current["id"]):
         raise HTTPException(status_code=403, detail="Forbidden")
-    result = _backend.stop_training(session_id, force=body.force)
+    result = _backend.stop_training(
+        session_id,
+        force=body.force,
+        user_id=current["id"],
+        access_token=current["token"],
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
     return result
+
+
+@app.get("/inference/models")
+def list_models(current=Depends(get_current_user)):
+    """List all trained .pth models available for inference."""
+    return _backend.list_models()
+
+
+@app.get("/sessions/{session_id}/checkpoints")
+def list_checkpoints(session_id: str, current=Depends(get_current_user)):
+    """List all saved checkpoints for a session's model."""
+    sess = _backend.sessions.get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if sess.get("user_id") not in (None, current["id"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    result = _backend.list_checkpoints(session_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
+    return result
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str, current=Depends(get_current_user)):
+    """
+    Delete a session and its local state file.
+    Only the owning user can delete a session.
+    Sessions with active training (status=training or preprocessing) are rejected.
+    """
+    sess = _backend.sessions.get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if sess.get("user_id") not in (None, current["id"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if sess.get("status") in ("training", "preprocessing"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete a session with status '{sess['status']}'. Stop training first.",
+        )
+    deleted = _backend.sessions.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"ok": True, "session_id": session_id}
 
 
 @app.post("/inference/convert")

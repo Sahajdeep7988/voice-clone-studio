@@ -7,7 +7,6 @@ Every public method returns a structured result dict — no raw exceptions.
 import os
 import time
 import threading
-from datetime import datetime, timezone
 
 from core.preprocessing    import AudioPreprocessor, PreprocessingError
 from core.llm_config       import LLMConfigurator
@@ -133,7 +132,13 @@ class AppBackend:
     # Training control
     # ------------------------------------------------------------------
 
-    def stop_training(self, session_id: str, force: bool = False) -> dict:
+    def stop_training(
+        self,
+        session_id:   str,
+        force:        bool = False,
+        user_id:      str | None = None,
+        access_token: str | None = None,
+    ) -> dict:
         session = self.sessions.get_session(session_id)
         if not session:
             return {"ok": False, "error": "Session not found"}
@@ -150,6 +155,8 @@ class AppBackend:
         latest     = checkpoint[-1] if checkpoint else None
         if latest:
             self.sessions.set_checkpoint(session_id, latest)
+        self._sync_supabase(session_id, user_id, access_token,
+                            status="paused", checkpoint_path=latest)
         return {"ok": True, "checkpoint": latest}
 
     def get_session_status(self, session_id: str) -> dict:
@@ -310,6 +317,36 @@ class AppBackend:
         return {"ok": True, "segment_count": len(valid)}
 
     # ------------------------------------------------------------------
+    # Supabase sync helper
+    # ------------------------------------------------------------------
+
+    def _sync_supabase(
+        self,
+        session_id:   str,
+        user_id:      str | None,
+        access_token: str | None,
+        **extra,
+    ) -> None:
+        """
+        Fire-and-forget Supabase upsert.  Silently skips when user_id or
+        access_token are absent (e.g. CLI run without --email/--password,
+        or unauthenticated local use).
+        """
+        if not user_id or not access_token:
+            return
+        session = self.sessions.get_session(session_id)
+        if not session:
+            return
+        record = {
+            "session_id": session_id,
+            "user_id":    user_id,
+            "model_name": session.get("model_name", ""),
+            "status":     session.get("status", ""),
+            **extra,
+        }
+        self.supabase.sync_training_session(record, access_token=access_token)
+
+    # ------------------------------------------------------------------
     # Pipeline worker
     # ------------------------------------------------------------------
 
@@ -331,6 +368,11 @@ class AppBackend:
         print(f"[Pipeline] Resume mode: {resume}")
 
         try:
+            # ── Sync: session created ─────────────────────────────────
+            self._sync_supabase(session_id, user_id, access_token,
+                                status="preprocessing",
+                                files=files)
+
             # ── Preprocess ────────────────────────────────────────────
             self.sessions.set_status(session_id, "preprocessing")
             session_base = os.path.join(self.base_dir, "sessions_data", session_id)
@@ -375,7 +417,11 @@ class AppBackend:
                 status="preprocessing_done",
             )
 
-            # Log failure summary if any files failed
+            # ── Sync: preprocessing done ──────────────────────────────
+            self._sync_supabase(session_id, user_id, access_token,
+                                status="preprocessing_done",
+                                segment_manifest=preprocessor.manifest)
+
             if stats.get("failed_count", 0) > 0:
                 log.warning(
                     f"Preprocessing partial: "
@@ -388,6 +434,9 @@ class AppBackend:
             validation   = self._validate_dataset(dataset_path)
             if not validation["ok"]:
                 self.sessions.set_status(session_id, "error", validation["error"])
+                self._sync_supabase(session_id, user_id, access_token,
+                                    status="error",
+                                    error_message=validation["error"])
                 return {"ok": False, "error": validation["error"], "session_id": session_id}
 
             # ── Hyperparameters ───────────────────────────────────────
@@ -410,9 +459,27 @@ class AppBackend:
             with self._lock:
                 self._engines[session_id] = engine
 
+            # ── Sync: training started ────────────────────────────────
+            self._sync_supabase(session_id, user_id, access_token,
+                                status="training",
+                                hyperparams=hyperparams,
+                                total_epochs=hyperparams.get("epochs", 0),
+                                hardware_profile=LLMConfigurator()._scan_hardware())
+
+            # Throttle progress syncs: at most one every 30 seconds.
+            _last_sync = [0.0]
+
             def on_progress(epoch: int, loss: float):
                 self.sessions.update_progress(session_id, epoch, loss)
                 get_logger(model_name, "train").info(f"epoch={epoch} loss={loss:.4f}")
+                now = time.time()
+                if now - _last_sync[0] >= 30:
+                    _last_sync[0] = now
+                    self._sync_supabase(session_id, user_id, access_token,
+                                        status="training",
+                                        current_epoch=epoch,
+                                        latest_loss=loss,
+                                        total_epochs=hyperparams.get("epochs", 0))
 
             with log.timed("training"):
                 model_path = engine.start_training(
@@ -426,21 +493,18 @@ class AppBackend:
             self.sessions.set_status(session_id, "done")
             self.sessions.set_checkpoint(session_id, model_path)
 
-            elapsed = int(time.time() - start)
+            elapsed          = int(time.time() - start)
+            final_session    = self.sessions.get_session(session_id)
+            epochs_completed = final_session.get("current_epoch", 0) if final_session else 0
 
-            # ── Supabase sync ─────────────────────────────────────────
-            if user_id and access_token:
-                self.supabase.sync_training_session({
-                    "user_id":          user_id,
-                    "model_name":       model_name,
-                    "status":           "completed",
-                    "duration_seconds": elapsed,
-                    "epochs_completed": self.sessions.get_session(session_id).get("current_epoch", 0),
-                    "hardware_profile": LLMConfigurator()._scan_hardware(),
-                    "session_id":       session_id,
-                    "checkpoint_path":  model_path,
-                    "created_at":       datetime.now(timezone.utc).isoformat(),
-                }, access_token=access_token)
+            # ── Sync: completed ───────────────────────────────────────
+            self._sync_supabase(session_id, user_id, access_token,
+                                status="completed",
+                                checkpoint_path=model_path,
+                                duration_seconds=elapsed,
+                                epochs_completed=epochs_completed,
+                                current_epoch=epochs_completed,
+                                hardware_profile=LLMConfigurator()._scan_hardware())
 
             log.success(f"Pipeline done: model_path={model_path} elapsed={elapsed}s")
             return {
@@ -459,10 +523,14 @@ class AppBackend:
         except PreprocessingError as e:
             self.sessions.set_status(session_id, "error", str(e))
             get_logger(stage="pipeline").error(str(e))
+            self._sync_supabase(session_id, user_id, access_token,
+                                status="error", error_message=str(e))
             return {"ok": False, "error": str(e), "session_id": session_id}
         except Exception as e:
             self.sessions.set_status(session_id, "error", str(e))
             get_logger(stage="pipeline").error(str(e))
+            self._sync_supabase(session_id, user_id, access_token,
+                                status="error", error_message=str(e))
             return {"ok": False, "error": str(e), "session_id": session_id}
         finally:
             with self._lock:

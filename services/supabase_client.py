@@ -6,7 +6,13 @@ All network calls fail gracefully when offline.
 """
 
 import os
+import requests
 from dotenv import load_dotenv
+
+try:
+    from supabase_auth.errors import AuthApiError
+except ImportError:
+    AuthApiError = Exception  # fallback: still caught, code/status unavailable
 
 load_dotenv()
 
@@ -32,16 +38,20 @@ class SupabaseClient:
             if response.session:
                 print(f"[Supabase] Logged in as {email}")
                 return {
-                    "ok": True,
-                    "user_id": response.user.id if response.user else None,
-                    "access_token": response.session.access_token,
+                    "ok":            True,
+                    "user_id":       response.user.id if response.user else None,
+                    "email":         response.user.email if response.user else None,
+                    "access_token":  response.session.access_token,
                     "refresh_token": response.session.refresh_token,
                 }
             print("[Supabase] Login failed: no session returned.")
-            return {"ok": False}
+            return {"ok": False, "code": "unknown", "detail": "No session returned."}
+        except AuthApiError as e:
+            print(f"[Supabase] Login error [{e.code}]: {e.message}")
+            return {"ok": False, "code": str(e.code), "detail": e.message, "status": e.status}
         except Exception as e:
-            print(f"[Supabase] Login failed (offline or error): {e}")
-            return {"ok": False}
+            print(f"[Supabase] Login failed (network/config): {e}")
+            return {"ok": False, "code": "network_error", "detail": str(e)}
 
     def register(self, email: str, password: str) -> dict:
         try:
@@ -52,16 +62,20 @@ class SupabaseClient:
             if response.user:
                 print(f"[Supabase] Registered: {email}")
                 return {
-                    "ok": True,
-                    "user_id": response.user.id,
-                    "access_token": response.session.access_token if response.session else None,
+                    "ok":            True,
+                    "user_id":       response.user.id,
+                    "email":         response.user.email,
+                    "access_token":  response.session.access_token  if response.session else None,
                     "refresh_token": response.session.refresh_token if response.session else None,
                 }
-            print("[Supabase] Registration failed.")
-            return {"ok": False}
+            print("[Supabase] Registration failed: no user returned.")
+            return {"ok": False, "code": "unknown", "detail": "Registration failed."}
+        except AuthApiError as e:
+            print(f"[Supabase] Register error [{e.code}]: {e.message}")
+            return {"ok": False, "code": str(e.code), "detail": e.message, "status": e.status}
         except Exception as e:
-            print(f"[Supabase] Registration failed: {e}")
-            return {"ok": False}
+            print(f"[Supabase] Registration failed (network/config): {e}")
+            return {"ok": False, "code": "network_error", "detail": str(e)}
 
     def logout(self) -> bool:
         try:
@@ -89,54 +103,79 @@ class SupabaseClient:
         except Exception as e:
             print(f"[Supabase] Token refresh failed: {e}")
         return {"ok": False}
+
+    def forgot_password(self, email: str) -> dict:
+        """Send a password-reset email via Supabase GoTrue."""
         try:
-            client   = self._get_client()
-            response = client.auth.refresh_session(self._refresh_token)
-            if response.session:
-                self._store_session(response)
-                print("[Supabase] Token refreshed.")
-                return True
+            client = self._get_client()
+            client.auth.reset_password_for_email(email)
+            return {"ok": True}
         except Exception as e:
-            print(f"[Supabase] Token refresh failed: {e}")
-        return False
+            print(f"[Supabase] forgot_password failed: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def reset_password(self, access_token: str, new_password: str) -> dict:
+        """
+        Update password using the recovery access_token from the reset-link.
+        Calls GoTrue PUT /user directly — stateless, does not touch the singleton session.
+        """
+        return self._auth_put_user(access_token, {"password": new_password})
+
+    def change_password(self, access_token: str, new_password: str) -> dict:
+        """
+        Update password for a logged-in user using their current JWT.
+        Calls GoTrue PUT /user directly — stateless, does not touch the singleton session.
+        """
+        return self._auth_put_user(access_token, {"password": new_password})
+
+    def resend_confirmation(self, email: str) -> dict:
+        """Resend the email-confirmation link for an unconfirmed account."""
+        try:
+            client = self._get_client()
+            client.auth.resend({"type": "signup", "email": email})
+            return {"ok": True}
+        except Exception as e:
+            print(f"[Supabase] resend_confirmation failed: {e}")
+            return {"ok": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Training session sync
     # ------------------------------------------------------------------
 
+    # Columns this method is allowed to write. created_at is intentionally
+    # excluded — DB DEFAULT handles the first INSERT and the fn_set_updated_at()
+    # trigger maintains updated_at on every subsequent write.
+    _SYNC_COLUMNS = {
+        "user_id", "session_id", "model_name", "status",
+        "files", "hyperparams",
+        "current_epoch", "total_epochs", "latest_loss",
+        "epochs_completed", "duration_seconds", "hardware_profile",
+        "checkpoint_path", "segment_manifest", "error_message",
+    }
+
     def sync_training_session(self, metadata: dict, access_token: str | None = None) -> bool:
+        """
+        Upsert any subset of training_sessions columns.
+        session_id is required (upsert conflict target).
+        Pass only the keys that changed — unchanged columns are left untouched by Postgres.
+        """
+        if not metadata.get("session_id"):
+            print("[Supabase] sync_training_session: session_id is required")
+            return False
         try:
             client = self._get_client()
             if access_token:
                 client.postgrest.auth(access_token)
 
-            # Bug-fixes vs original:
-            #   1. on_conflict now targets session_id (the actual UNIQUE column).
-            #      The old target (user_id,model_name,created_at) had no UNIQUE
-            #      constraint, so every call was a blind INSERT that silently failed.
-            #   2. created_at is excluded from the upsert record so the DB default
-            #      (NOW()) is used on INSERT and the value is never overwritten on
-            #      subsequent UPDATE syncs.  Sending it would reset the creation
-            #      timestamp to the current time on every training-complete event.
-            record = {
-                "user_id":          metadata.get("user_id"),
-                "model_name":       metadata.get("model_name", ""),
-                "status":           metadata.get("status", "completed"),
-                "duration_seconds": metadata.get("duration_seconds", 0),
-                "epochs_completed": metadata.get("epochs_completed", 0),
-                "hardware_profile": metadata.get("hardware_profile", {}),
-                "session_id":       metadata.get("session_id"),
-                "checkpoint_path":  metadata.get("checkpoint_path"),
-                # created_at intentionally omitted — DB DEFAULT handles first INSERT;
-                # updated_at is auto-maintained by the fn_set_updated_at() trigger.
-            }
+            record = {k: v for k, v in metadata.items() if k in self._SYNC_COLUMNS}
+
             response = (
                 client.table("training_sessions")
                 .upsert(record, on_conflict="session_id")
                 .execute()
             )
             if response.data:
-                print(f"[Supabase] Synced: {record['model_name']} ({record['status']})")
+                print(f"[Supabase] Synced: {record.get('model_name', '?')} ({record.get('status', '?')})")
                 return True
             print("[Supabase] Sync returned no data.")
             return False
@@ -188,6 +227,32 @@ class SupabaseClient:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _auth_put_user(self, access_token: str, attrs: dict) -> dict:
+        """
+        Stateless GoTrue PUT /user call authenticated with the provided JWT.
+        Used for password reset and change-password flows — never mutates
+        the singleton client's internal session.
+        """
+        try:
+            url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
+            resp = requests.put(
+                url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "apikey": SUPABASE_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=attrs,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return {"ok": True}
+            body = resp.json() if resp.content else {}
+            return {"ok": False, "error": body.get("message") or body.get("msg") or "Update failed"}
+        except Exception as e:
+            print(f"[Supabase] _auth_put_user failed: {e}")
+            return {"ok": False, "error": str(e)}
 
     def _get_client(self):
         if self._client is not None:
